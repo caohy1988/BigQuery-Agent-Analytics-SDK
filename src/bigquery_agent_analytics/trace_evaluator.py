@@ -465,7 +465,7 @@ Required JSON format:
       self,
       project_id: str,
       dataset_id: str,
-      table_id: str = "agent_events_v2",
+      table_id: str = "agent_events",
       client: Optional[bigquery.Client] = None,
       llm_judge_model: Optional[str] = None,
   ) -> None:

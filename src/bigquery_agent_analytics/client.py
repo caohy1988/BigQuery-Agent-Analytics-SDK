@@ -156,6 +156,18 @@ _REQUIRED_COLUMNS = {
     "event_type",
     "session_id",
     "content",
+    "agent",
+    "invocation_id",
+    "user_id",
+    "trace_id",
+    "span_id",
+    "parent_span_id",
+    "attributes",
+    "latency_ms",
+    "status",
+    "error_message",
+    "content_parts",
+    "is_truncated",
 }
 
 
@@ -191,7 +203,7 @@ class Client:
       self,
       project_id: str,
       dataset_id: str,
-      table_id: str = "agent_events_v2",
+      table_id: str = "agent_events",
       location: str = "us-central1",
       gcs_bucket_name: Optional[str] = None,
       verify_schema: bool = True,
