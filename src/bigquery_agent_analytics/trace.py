@@ -22,7 +22,7 @@ hierarchical DAG view of the agent's reasoning steps.
 Example usage::
 
     client = Client(project_id="my-project", dataset_id="analytics")
-    trace = client.get_trace("session-123")
+    trace = client.get_trace("trace-123")
     trace.render()  # Prints hierarchical DAG in notebook/terminal
 """
 
@@ -71,6 +71,16 @@ class EventType(Enum):
 
 
 @dataclass
+class ObjectRef:
+  """Reference to an externally stored object."""
+
+  uri: Optional[str] = None
+  version: Optional[str] = None
+  authorizer: Optional[str] = None
+  details: Optional[dict[str, Any]] = None
+
+
+@dataclass
 class ContentPart:
   """A single part of multimodal content."""
 
@@ -78,6 +88,9 @@ class ContentPart:
   text: Optional[str] = None
   uri: Optional[str] = None
   storage_mode: Optional[str] = None
+  object_ref: Optional[ObjectRef] = None
+  part_index: Optional[int] = None
+  part_attributes: Optional[str] = None
 
 
 @dataclass
@@ -138,12 +151,24 @@ class Span:
     content_parts = []
     if parts_raw:
       for p in parts_raw:
+        obj_ref = None
+        obj_ref_raw = p.get("object_ref")
+        if obj_ref_raw and isinstance(obj_ref_raw, dict):
+          obj_ref = ObjectRef(
+              uri=obj_ref_raw.get("uri"),
+              version=obj_ref_raw.get("version"),
+              authorizer=obj_ref_raw.get("authorizer"),
+              details=obj_ref_raw.get("details"),
+          )
         content_parts.append(
             ContentPart(
                 mime_type=p.get("mime_type"),
                 text=p.get("text"),
                 uri=p.get("uri"),
                 storage_mode=p.get("storage_mode"),
+                object_ref=obj_ref,
+                part_index=p.get("part_index"),
+                part_attributes=p.get("part_attributes"),
             )
         )
 
@@ -226,13 +251,18 @@ class Span:
       text = self.content.get("response") or ""
     if not text:
       text = self.content.get("text") or ""
+    if not text:
+      text = self.content.get("raw") or ""
     if not text and self.content_parts:
       for p in self.content_parts:
         if p.text:
           text = p.text
           break
-        if p.uri:
-          text = f"[{p.mime_type or 'file'}] {p.uri}"
+        p_uri = p.uri
+        if not p_uri and p.object_ref:
+          p_uri = p.object_ref.uri
+        if p_uri:
+          text = f"[{p.mime_type or 'file'}] {p_uri}"
           break
 
     if len(text) > 120:
@@ -485,9 +515,12 @@ class Trace:
     # Multimodal content parts
     child_prefix = prefix + ("   " if is_last else "\u2502  ")
     for part in span.content_parts:
-      if part.uri:
+      part_uri = part.uri
+      if not part_uri and part.object_ref:
+        part_uri = part.object_ref.uri
+      if part_uri:
         lines.append(
-            f"{child_prefix}   [{part.mime_type or 'file'}] {part.uri}"
+            f"{child_prefix}   [{part.mime_type or 'file'}] {part_uri}"
         )
 
     for i, child in enumerate(span.children):
@@ -522,35 +555,47 @@ class Trace:
       elif span.event_type in ("TOOL_COMPLETED", "TOOL_ERROR"):
         key = span.span_id or span.content.get("tool", "")
         start = starts.pop(key, None)
-        calls.append({
+        origin = (
+            span.content.get("tool_origin")
+            or (start.content.get("tool_origin") if start else None)
+        )
+        entry = {
             "tool_name": span.content.get("tool", "unknown"),
             "args": start.content.get("args", {}) if start else {},
             "result": span.content.get("result"),
             "status": span.status,
             "error": span.error_message,
             "latency_ms": span.latency_ms,
-        })
+        }
+        if origin:
+          entry["tool_origin"] = origin
+        calls.append(entry)
 
     return calls
 
   @property
   def final_response(self) -> Optional[str]:
-    """Extracts the final agent response text."""
+    """Extracts the final agent response text.
+
+    Checks LLM_RESPONSE first (the ADK plugin always populates
+    ``content.response`` there), then falls back to
+    AGENT_COMPLETED for backward compatibility.
+    """
     for span in reversed(self.spans):
-      if span.event_type == "AGENT_COMPLETED":
+      if span.event_type == "LLM_RESPONSE":
         c = span.content
         if isinstance(c, dict):
-          result = c.get("response") or c.get("text_summary")
+          result = c.get("response")
           if result:
             return result
         elif c:
           return str(c)
 
     for span in reversed(self.spans):
-      if span.event_type == "LLM_RESPONSE":
+      if span.event_type == "AGENT_COMPLETED":
         c = span.content
         if isinstance(c, dict):
-          result = c.get("response")
+          result = c.get("response") or c.get("text_summary")
           if result:
             return result
         elif c:

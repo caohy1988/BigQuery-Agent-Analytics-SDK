@@ -24,7 +24,7 @@ from bigquery_agent_analytics.views import ViewManager
 
 PROJECT = "test-project"
 DATASET = "analytics"
-TABLE = "agent_events_v2"
+TABLE = "agent_events"
 
 
 @pytest.fixture
@@ -46,6 +46,12 @@ class TestViewManager:
     assert "TOOL_COMPLETED" in types
     assert "TOOL_ERROR" in types
     assert "STATE_DELTA" in types
+    assert "HITL_CREDENTIAL_REQUEST" in types
+    assert "HITL_CONFIRMATION_REQUEST" in types
+    assert "HITL_INPUT_REQUEST" in types
+    assert "HITL_CREDENTIAL_REQUEST_COMPLETED" in types
+    assert "HITL_CONFIRMATION_REQUEST_COMPLETED" in types
+    assert "HITL_INPUT_REQUEST_COMPLETED" in types
     assert len(types) == len(_EVENT_VIEW_DEFS)
 
   def test_get_view_name(self, vm):

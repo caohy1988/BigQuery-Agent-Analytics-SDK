@@ -82,7 +82,7 @@ class BigFramesEvaluator:
       self,
       project_id: str,
       dataset_id: str,
-      table_id: str = "agent_events_v2",
+      table_id: str = "agent_events",
       endpoint: Optional[str] = None,
       connection_id: Optional[str] = None,
   ) -> None:

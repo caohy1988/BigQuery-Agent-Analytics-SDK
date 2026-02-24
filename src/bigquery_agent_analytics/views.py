@@ -15,7 +15,7 @@
 """Event-specific BigQuery views for agent analytics.
 
 Creates standard (non-materialized) BigQuery views that unnest the
-generic ``agent_events_v2`` table into per-event-type views with typed
+generic ``agent_events`` table into per-event-type views with typed
 columns.  Every view retains the standard identity headers:
 ``timestamp``, ``agent``, ``session_id``, ``invocation_id``.
 
@@ -26,7 +26,7 @@ Example usage::
     vm = ViewManager(
         project_id="my-project",
         dataset_id="analytics",
-        table_id="agent_events_v2",
+        table_id="agent_events",
     )
     vm.create_all_views()              # create all per-event views
     vm.create_view("LLM_REQUEST")      # create a single view
@@ -174,6 +174,48 @@ _EVENT_VIEW_DEFS: dict[str, tuple[str, str]] = {
   JSON_EXTRACT(attributes, '$.state_delta') AS state_delta,
   content""",
     ),
+    "HITL_CREDENTIAL_REQUEST": (
+        "hitl_credential_requests",
+        """\
+  JSON_EXTRACT_SCALAR(content, '$.tool') AS tool_name,
+  JSON_EXTRACT(content, '$.args') AS tool_args,
+  content""",
+    ),
+    "HITL_CONFIRMATION_REQUEST": (
+        "hitl_confirmation_requests",
+        """\
+  JSON_EXTRACT_SCALAR(content, '$.tool') AS tool_name,
+  JSON_EXTRACT(content, '$.args') AS tool_args,
+  content""",
+    ),
+    "HITL_INPUT_REQUEST": (
+        "hitl_input_requests",
+        """\
+  JSON_EXTRACT_SCALAR(content, '$.tool') AS tool_name,
+  JSON_EXTRACT(content, '$.args') AS tool_args,
+  content""",
+    ),
+    "HITL_CREDENTIAL_REQUEST_COMPLETED": (
+        "hitl_credential_completions",
+        """\
+  JSON_EXTRACT_SCALAR(content, '$.tool') AS tool_name,
+  JSON_EXTRACT(content, '$.result') AS tool_result,
+  content""",
+    ),
+    "HITL_CONFIRMATION_REQUEST_COMPLETED": (
+        "hitl_confirmation_completions",
+        """\
+  JSON_EXTRACT_SCALAR(content, '$.tool') AS tool_name,
+  JSON_EXTRACT(content, '$.result') AS tool_result,
+  content""",
+    ),
+    "HITL_INPUT_REQUEST_COMPLETED": (
+        "hitl_input_completions",
+        """\
+  JSON_EXTRACT_SCALAR(content, '$.tool') AS tool_name,
+  JSON_EXTRACT(content, '$.result') AS tool_result,
+  content""",
+    ),
 }
 
 # ------------------------------------------------------------------ #
@@ -221,7 +263,7 @@ class ViewManager:
   Args:
       project_id: Google Cloud project ID.
       dataset_id: BigQuery dataset containing agent events.
-      table_id: Source table name (default ``agent_events_v2``).
+      table_id: Source table name (default ``agent_events``).
       view_prefix: Optional prefix for view names (e.g. ``"adk_"``).
       bq_client: Optional pre-configured BigQuery client.
   """
@@ -230,7 +272,7 @@ class ViewManager:
       self,
       project_id: str,
       dataset_id: str,
-      table_id: str = "agent_events_v2",
+      table_id: str = "agent_events",
       view_prefix: str = "adk_",
       bq_client: Optional[bigquery.Client] = None,
   ) -> None:

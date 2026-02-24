@@ -18,6 +18,7 @@ from datetime import datetime
 from datetime import timezone
 
 from bigquery_agent_analytics.trace import ContentPart
+from bigquery_agent_analytics.trace import ObjectRef
 from bigquery_agent_analytics.trace import Span
 from bigquery_agent_analytics.trace import Trace
 from bigquery_agent_analytics.trace import TraceFilter
@@ -162,6 +163,65 @@ class TestSpan:
     assert "image/png" in span.summary
     assert "gs://bucket/image.png" in span.summary
 
+  def test_from_bigquery_row_with_object_ref(self):
+    row = {
+        "event_type": "LLM_RESPONSE",
+        "agent": "agent",
+        "timestamp": datetime.now(timezone.utc),
+        "content": "{}",
+        "attributes": "{}",
+        "content_parts": [{
+            "mime_type": "image/png",
+            "uri": None,
+            "text": None,
+            "storage_mode": "GCS_REFERENCE",
+            "object_ref": {
+                "uri": "gs://bucket/ref.png",
+                "version": "v1",
+                "authorizer": "sa@proj.iam",
+                "details": None,
+            },
+            "part_index": 0,
+            "part_attributes": '{"source": "camera"}',
+        }],
+        "status": "OK",
+    }
+    span = Span.from_bigquery_row(row)
+    assert len(span.content_parts) == 1
+    part = span.content_parts[0]
+    assert part.object_ref is not None
+    assert part.object_ref.uri == "gs://bucket/ref.png"
+    assert part.object_ref.version == "v1"
+    assert part.object_ref.authorizer == "sa@proj.iam"
+    assert part.part_index == 0
+    assert part.part_attributes == '{"source": "camera"}'
+
+  def test_summary_from_object_ref_uri(self):
+    span = Span(
+        event_type="LLM_RESPONSE",
+        agent="agent",
+        timestamp=datetime.now(timezone.utc),
+        content={},
+        content_parts=[
+            ContentPart(
+                mime_type="audio/wav",
+                object_ref=ObjectRef(uri="gs://b/audio.wav"),
+            )
+        ],
+    )
+    assert "audio/wav" in span.summary
+    assert "gs://b/audio.wav" in span.summary
+
+  def test_summary_raw_content_fallback(self):
+    """AGENT_STARTING stores raw string content."""
+    span = Span(
+        event_type="AGENT_STARTING",
+        agent="agent",
+        timestamp=datetime.now(timezone.utc),
+        content={"raw": "You are a helpful assistant"},
+    )
+    assert span.summary == "You are a helpful assistant"
+
 
 class TestTrace:
   """Tests for Trace class."""
@@ -277,6 +337,79 @@ class TestTrace:
         spans=self._make_spans(),
     )
     assert trace.final_response == "Hi there!"
+
+  def test_final_response_prefers_llm_response(self):
+    """LLM_RESPONSE is preferred over AGENT_COMPLETED."""
+    ts = datetime.now(timezone.utc)
+    spans = [
+        Span(
+            event_type="LLM_RESPONSE",
+            agent="agent",
+            timestamp=ts,
+            content={"response": "LLM said this"},
+        ),
+        Span(
+            event_type="AGENT_COMPLETED",
+            agent="agent",
+            timestamp=ts,
+            content={"response": "Agent said this"},
+        ),
+    ]
+    trace = Trace(trace_id="t", session_id="s", spans=spans)
+    assert trace.final_response == "LLM said this"
+
+  def test_final_response_null_agent_completed(self):
+    """Handles null AGENT_COMPLETED content (ADK plugin behavior)."""
+    ts = datetime.now(timezone.utc)
+    spans = [
+        Span(
+            event_type="LLM_RESPONSE",
+            agent="agent",
+            timestamp=ts,
+            content={"response": "From LLM"},
+        ),
+        Span(
+            event_type="AGENT_COMPLETED",
+            agent="agent",
+            timestamp=ts,
+            content={},
+        ),
+    ]
+    trace = Trace(trace_id="t", session_id="s", spans=spans)
+    assert trace.final_response == "From LLM"
+
+  def test_tool_calls_includes_tool_origin(self):
+    """tool_origin from content is included in tool_calls."""
+    ts = datetime.now(timezone.utc)
+    spans = [
+        Span(
+            event_type="TOOL_STARTING",
+            agent="agent",
+            timestamp=ts,
+            content={
+                "tool": "search",
+                "args": {},
+                "tool_origin": "MCP",
+            },
+            span_id="t1",
+        ),
+        Span(
+            event_type="TOOL_COMPLETED",
+            agent="agent",
+            timestamp=ts,
+            content={
+                "tool": "search",
+                "result": {},
+                "tool_origin": "MCP",
+            },
+            span_id="t1",
+            status="OK",
+        ),
+    ]
+    trace = Trace(trace_id="t", session_id="s", spans=spans)
+    calls = trace.tool_calls
+    assert len(calls) == 1
+    assert calls[0]["tool_origin"] == "MCP"
 
   def test_error_spans(self):
     ts = datetime.now(timezone.utc)
