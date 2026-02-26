@@ -262,7 +262,6 @@ def _run_sync(coro):
   return asyncio.run(coro)
 
 
-
 # ------------------------------------------------------------------ #
 # Client                                                               #
 # ------------------------------------------------------------------ #
@@ -795,7 +794,6 @@ class Client:
       evaluator: CodeEvaluator | LLMAsJudge,
       filters: Optional[TraceFilter] = None,
       dataset: Optional[str] = None,
-      golden_dataset: Optional[str] = None,
       strict: bool = False,
   ) -> EvaluationReport:
     """Runs batch evaluation over traces.
@@ -809,14 +807,12 @@ class Client:
         evaluator: A CodeEvaluator or LLMAsJudge instance.
         filters: Optional trace filters.
         dataset: Optional table name override.
-        golden_dataset: Optional golden dataset table for
-            comparison evaluation.
         strict: When ``True``, sessions with unparseable or
             empty judge output are marked as failed instead of
             silently passing.  Affected sessions get
             ``parse_error: True`` in their details, and
             ``aggregate_scores`` includes a ``parse_errors``
-            count.
+            count (always present, ``0.0`` when no errors).
 
     Returns:
         EvaluationReport with per-session and aggregate scores.
@@ -1732,8 +1728,7 @@ def _merge_criterion_reports(
     # Must have at least one score AND all criteria above threshold.
     # Missing criteria default to 0.0 (guaranteed fail).
     passed = bool(scores) and all(
-        scores.get(c.name, 0.0) >= thresholds.get(c.name, 0.5)
-        for c in criteria
+        scores.get(c.name, 0.0) >= thresholds.get(c.name, 0.5) for c in criteria
     )
     session_scores.append(
         SessionScore(
@@ -1822,8 +1817,7 @@ def _apply_strict_mode(report: EvaluationReport) -> EvaluationReport:
 
   passed = sum(1 for s in new_scores if s.passed)
   agg = dict(report.aggregate_scores)
-  if parse_errors:
-    agg["parse_errors"] = float(parse_errors)
+  agg["parse_errors"] = float(parse_errors)
   return EvaluationReport(
       dataset=report.dataset,
       evaluator_name=report.evaluator_name,

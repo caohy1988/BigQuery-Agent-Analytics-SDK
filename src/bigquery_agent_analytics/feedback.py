@@ -334,8 +334,14 @@ SELECT
 FROM questions
 """
 
-# Keep backward-compatible alias.
-_SEMANTIC_GROUPING_QUERY = _LEGACY_SEMANTIC_GROUPING_QUERY
+
+def _is_legacy_model_ref(ref: str) -> bool:
+  """Returns True when *ref* looks like a BQ ML model reference.
+
+  Legacy model references have the form
+  ``project.dataset.model_name`` (two or more dots).
+  """
+  return ref.count(".") >= 2
 
 
 async def compute_drift(
@@ -428,23 +434,29 @@ async def compute_drift(
           e,
       )
 
-  # Simple keyword overlap matching
-  golden_set = set(q.lower().strip() for q in golden_questions)
-  prod_set = set(q.lower().strip() for q in prod_questions)
+  # Simple keyword overlap matching — compare lowercased but
+  # return original-cased questions for fidelity.
+  golden_by_key = {q.lower().strip(): q for q in golden_questions}
+  prod_by_key = {q.lower().strip(): q for q in prod_questions}
 
-  covered = golden_set & prod_set
-  uncovered = golden_set - prod_set
-  new_in_prod = prod_set - golden_set
+  golden_keys = set(golden_by_key)
+  prod_keys = set(prod_by_key)
 
-  coverage = (len(covered) / len(golden_set) * 100) if golden_set else 0.0
+  covered_keys = golden_keys & prod_keys
+  uncovered_keys = golden_keys - prod_keys
+  new_keys = prod_keys - golden_keys
+
+  coverage = (
+      (len(covered_keys) / len(golden_keys) * 100) if golden_keys else 0.0
+  )
 
   return DriftReport(
       coverage_percentage=coverage,
       total_golden=len(golden_questions),
       total_production=len(prod_questions),
-      covered_questions=sorted(covered),
-      uncovered_questions=sorted(uncovered),
-      new_questions=sorted(list(new_in_prod)[:100]),
+      covered_questions=sorted(golden_by_key[k] for k in covered_keys),
+      uncovered_questions=sorted(golden_by_key[k] for k in uncovered_keys),
+      new_questions=sorted([prod_by_key[k] for k in new_keys])[:100],
   )
 
 
@@ -531,10 +543,12 @@ async def _semantic_drift(
     if gq not in seen_golden:
       uncovered.append(gq)
 
-  # Identify new production questions (no close golden match)
-  golden_set_lower = set(q.lower().strip() for q in golden_questions)
-  prod_set_lower = set(q.lower().strip() for q in prod_questions)
-  new_in_prod = sorted(list(prod_set_lower - golden_set_lower)[:100])
+  # Identify new production questions (no close golden match) —
+  # compare lowercased but return original-cased questions.
+  golden_by_key = {q.lower().strip(): q for q in golden_questions}
+  prod_by_key = {q.lower().strip(): q for q in prod_questions}
+  new_keys = set(prod_by_key) - set(golden_by_key)
+  new_in_prod = sorted([prod_by_key[k] for k in new_keys])[:100]
 
   total_golden = len(golden_questions)
   coverage = (len(covered) / total_golden * 100) if total_golden else 0.0
@@ -736,7 +750,21 @@ async def _semantic_grouping(
     text_model,
     loop,
 ) -> QuestionDistribution:
-  """Groups questions semantically using LLM classification."""
+  """Groups questions semantically using LLM classification.
+
+  Uses the same endpoint-routing strategy as the evaluators
+  and insights modules:
+
+  1. AI.GENERATE — when the endpoint is not a legacy BQ ML
+     model reference (default path).
+  2. Legacy ML.GENERATE_TEXT — when the endpoint has 2+ dots
+     (``project.dataset.model``).
+  3. Fallback — ``frequently_asked`` when neither path
+     succeeds.
+
+  The ``details`` dict of the returned distribution includes a
+  ``grouping_mode`` key reporting which path was used.
+  """
   from google.cloud import bigquery
 
   # Use LLM to classify if model available
@@ -755,58 +783,67 @@ async def _semantic_grouping(
         ]
     )
 
-    query = _SEMANTIC_GROUPING_QUERY.format(
-        project=project_id,
-        dataset=dataset_id,
-        table=table_id,
-        where=where_clause,
-        model=text_model,
-        categories=categories_str,
-    )
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=query_params,
-    )
-
-    try:
-      job = await loop.run_in_executor(
-          None,
-          lambda: bq_client.query(query, job_config=job_config),
-      )
-      rows = await loop.run_in_executor(
-          None,
-          lambda: list(job.result()),
-      )
-
-      # Aggregate by category
-      cat_data: dict[str, list[str]] = {}
-      for r in rows:
-        cat = (r.get("category") or "Other").strip()
-        q = r.get("question", "")
-        cat_data.setdefault(cat, []).append(q)
-
-      total = sum(len(v) for v in cat_data.values())
-      result_cats = []
-      for name, examples in cat_data.items():
-        pct = (len(examples) / total * 100) if total else 0.0
-        result_cats.append(
-            QuestionCategory(
-                name=name,
-                count=len(examples),
-                percentage=pct,
-                examples=examples[: config.top_k],
-            )
+    # Try AI.GENERATE first when the endpoint is not a legacy ref
+    if not _is_legacy_model_ref(text_model):
+      try:
+        query = _AI_GENERATE_SEMANTIC_GROUPING_QUERY.format(
+            project=project_id,
+            dataset=dataset_id,
+            table=table_id,
+            where=where_clause,
+            endpoint=text_model,
+            categories=categories_str,
+        )
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=query_params,
+        )
+        result = await _run_grouping_query(
+            bq_client,
+            query,
+            job_config,
+            config,
+            loop,
+        )
+        result.details["grouping_mode"] = "ai_generate"
+        return result
+      except Exception as e:
+        logger.debug(
+            "AI.GENERATE semantic grouping failed, trying legacy: %s",
+            e,
         )
 
-      return QuestionDistribution(
-          total_questions=total,
-          categories=result_cats,
+    # Legacy ML.GENERATE_TEXT path
+    legacy_model = (
+        text_model
+        if _is_legacy_model_ref(text_model)
+        else f"{project_id}.{dataset_id}.gemini_text_model"
+    )
+    try:
+      query = _LEGACY_SEMANTIC_GROUPING_QUERY.format(
+          project=project_id,
+          dataset=dataset_id,
+          table=table_id,
+          where=where_clause,
+          model=legacy_model,
+          categories=categories_str,
       )
-
+      job_config = bigquery.QueryJobConfig(
+          query_parameters=query_params,
+      )
+      result = await _run_grouping_query(
+          bq_client,
+          query,
+          job_config,
+          config,
+          loop,
+      )
+      result.details["grouping_mode"] = "legacy_ml_generate_text"
+      return result
     except Exception as e:
       logger.warning("Semantic grouping failed: %s", e)
 
   # Fallback: return frequently asked
-  return await _frequently_asked(
+  result = await _frequently_asked(
       bq_client,
       project_id,
       dataset_id,
@@ -815,4 +852,49 @@ async def _semantic_grouping(
       query_params,
       config.top_k,
       loop,
+  )
+  result.details["grouping_mode"] = "frequently_asked_fallback"
+  return result
+
+
+async def _run_grouping_query(
+    bq_client,
+    query,
+    job_config,
+    config,
+    loop,
+) -> QuestionDistribution:
+  """Executes a semantic grouping query and aggregates results."""
+  job = await loop.run_in_executor(
+      None,
+      lambda: bq_client.query(query, job_config=job_config),
+  )
+  rows = await loop.run_in_executor(
+      None,
+      lambda: list(job.result()),
+  )
+
+  # Aggregate by category
+  cat_data: dict[str, list[str]] = {}
+  for r in rows:
+    cat = (r.get("category") or "Other").strip()
+    q = r.get("question", "")
+    cat_data.setdefault(cat, []).append(q)
+
+  total = sum(len(v) for v in cat_data.values())
+  result_cats = []
+  for name, examples in cat_data.items():
+    pct = (len(examples) / total * 100) if total else 0.0
+    result_cats.append(
+        QuestionCategory(
+            name=name,
+            count=len(examples),
+            percentage=pct,
+            examples=examples[: config.top_k],
+        )
+    )
+
+  return QuestionDistribution(
+      total_questions=total,
+      categories=result_cats,
   )

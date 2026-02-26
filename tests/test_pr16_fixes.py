@@ -384,9 +384,7 @@ class TestCanonicalErrorPredicates:
 
   def test_feedback_unanswered_query_uses_canonical_predicate(self):
     """_FREQUENTLY_UNANSWERED_QUERY uses canonical error predicate."""
-    from bigquery_agent_analytics.feedback import (
-        _FREQUENTLY_UNANSWERED_QUERY,
-    )
+    from bigquery_agent_analytics.feedback import _FREQUENTLY_UNANSWERED_QUERY
 
     assert "ENDS_WITH(event_type, '_ERROR')" in _FREQUENTLY_UNANSWERED_QUERY
     assert "error_message IS NOT NULL" in _FREQUENTLY_UNANSWERED_QUERY
@@ -450,16 +448,12 @@ class TestResponseSourceOrder:
     assert result == "Only agent"
 
   def test_memory_service_query_includes_llm_response(self):
-    from bigquery_agent_analytics.memory_service import (
-        BigQuerySessionMemory,
-    )
+    from bigquery_agent_analytics.memory_service import BigQuerySessionMemory
 
     assert "LLM_RESPONSE" in BigQuerySessionMemory._RECENT_CONTEXT_QUERY
 
   def test_ai_ml_index_query_includes_llm_response(self):
-    from bigquery_agent_analytics.ai_ml_integration import (
-        EmbeddingSearchClient,
-    )
+    from bigquery_agent_analytics.ai_ml_integration import EmbeddingSearchClient
 
     assert "LLM_RESPONSE" in EmbeddingSearchClient._INDEX_EMBEDDINGS_QUERY
 
@@ -615,7 +609,8 @@ class TestStrictModeParseErrors:
     )
     strict_report = _apply_strict_mode(report)
 
-    assert "parse_errors" not in strict_report.aggregate_scores
+    # parse_errors is always present for stable output schema.
+    assert strict_report.aggregate_scores["parse_errors"] == 0.0
 
 
 # ================================================================== #
@@ -781,18 +776,14 @@ class TestEventSemanticsWired:
   """Verify event_semantics predicates used across modules."""
 
   def test_error_sql_predicate_canonical_form(self):
-    from bigquery_agent_analytics.event_semantics import (
-        ERROR_SQL_PREDICATE,
-    )
+    from bigquery_agent_analytics.event_semantics import ERROR_SQL_PREDICATE
 
     assert "ENDS_WITH(event_type, '_ERROR')" in ERROR_SQL_PREDICATE
     assert "error_message IS NOT NULL" in ERROR_SQL_PREDICATE
     assert "status = 'ERROR'" in ERROR_SQL_PREDICATE
 
   def test_response_event_types_includes_llm_response(self):
-    from bigquery_agent_analytics.event_semantics import (
-        RESPONSE_EVENT_TYPES,
-    )
+    from bigquery_agent_analytics.event_semantics import RESPONSE_EVENT_TYPES
 
     assert "LLM_RESPONSE" in RESPONSE_EVENT_TYPES
 
@@ -844,9 +835,7 @@ class TestMemoryServiceLLMResponse:
 
   def test_get_recent_context_processes_llm_response(self):
     """BigQuerySessionMemory should process LLM_RESPONSE events."""
-    from bigquery_agent_analytics.memory_service import (
-        BigQuerySessionMemory,
-    )
+    from bigquery_agent_analytics.memory_service import BigQuerySessionMemory
 
     query = BigQuerySessionMemory._RECENT_CONTEXT_QUERY
     assert "'LLM_RESPONSE'" in query
