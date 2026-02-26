@@ -26,7 +26,6 @@ Example usage:
     evaluator = BigQueryTraceEvaluator(
         project_id="my-project",
         dataset_id="agent_analytics",
-        table_id="agent_events_v2",
     )
 
     results = await evaluator.evaluate_session(
@@ -399,7 +398,6 @@ class BigQueryTraceEvaluator:
       evaluator = BigQueryTraceEvaluator(
           project_id="my-project",
           dataset_id="agent_analytics",
-          table_id="agent_events_v2",
       )
 
       result = await evaluator.evaluate_session(
@@ -409,6 +407,27 @@ class BigQueryTraceEvaluator:
   """
 
   # SQL query to retrieve complete session trace
+  _DEFAULT_EVENT_TYPES = [
+      "USER_MESSAGE_RECEIVED",
+      "AGENT_STARTING",
+      "AGENT_COMPLETED",
+      "TOOL_STARTING",
+      "TOOL_COMPLETED",
+      "TOOL_ERROR",
+      "LLM_REQUEST",
+      "LLM_RESPONSE",
+      "LLM_ERROR",
+      "INVOCATION_STARTING",
+      "INVOCATION_COMPLETED",
+      "STATE_DELTA",
+      "HITL_CONFIRMATION_REQUEST",
+      "HITL_CONFIRMATION_REQUEST_COMPLETED",
+      "HITL_CREDENTIAL_REQUEST",
+      "HITL_CREDENTIAL_REQUEST_COMPLETED",
+      "HITL_INPUT_REQUEST",
+      "HITL_INPUT_REQUEST_COMPLETED",
+  ]
+
   _SESSION_TRACE_QUERY = """
   SELECT
     event_type,
@@ -424,17 +443,7 @@ class BigQueryTraceEvaluator:
     user_id
   FROM `{project}.{dataset}.{table}`
   WHERE session_id = @session_id
-    AND event_type IN (
-      'USER_MESSAGE_RECEIVED',
-      'AGENT_STARTING', 'AGENT_COMPLETED',
-      'TOOL_STARTING', 'TOOL_COMPLETED', 'TOOL_ERROR',
-      'LLM_REQUEST', 'LLM_RESPONSE', 'LLM_ERROR',
-      'INVOCATION_STARTING', 'INVOCATION_COMPLETED',
-      'STATE_DELTA',
-      'HITL_CONFIRMATION_REQUEST', 'HITL_CONFIRMATION_REQUEST_COMPLETED',
-      'HITL_CREDENTIAL_REQUEST', 'HITL_CREDENTIAL_REQUEST_COMPLETED',
-      'HITL_INPUT_REQUEST', 'HITL_INPUT_REQUEST_COMPLETED'
-    )
+    AND event_type IN UNNEST(@event_types)
   ORDER BY timestamp ASC
   """
 
@@ -475,15 +484,21 @@ Required JSON format:
       table_id: str = "agent_events",
       client: Optional[bigquery.Client] = None,
       llm_judge_model: Optional[str] = None,
+      include_event_types: Optional[list[str]] = None,
   ) -> None:
     """Initializes the BigQueryTraceEvaluator.
 
     Args:
         project_id: Google Cloud project ID.
         dataset_id: BigQuery dataset ID containing trace data.
-        table_id: BigQuery table ID. Defaults to "agent_events_v2".
+        table_id: BigQuery table ID. Defaults to "agent_events".
         client: Optional BigQuery client. Created if not provided.
         llm_judge_model: Optional model name for LLM-as-judge evaluation.
+        include_event_types: Optional list of event types to include
+            when fetching session traces.  Defaults to all standard
+            ADK event types including HITL and STATE_DELTA.  Pass a
+            custom list to restrict or extend the event types
+            evaluated without patching SQL templates.
     """
     self.project_id = project_id
     self.dataset_id = dataset_id
@@ -491,6 +506,7 @@ Required JSON format:
     self.table_ref = f"{project_id}.{dataset_id}.{table_id}"
     self._client = client
     self.llm_judge_model = llm_judge_model or "gemini-2.5-flash"
+    self.include_event_types = include_event_types or self._DEFAULT_EVENT_TYPES
 
   @property
   def client(self) -> bigquery.Client:
@@ -516,7 +532,16 @@ Required JSON format:
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
-            bigquery.ScalarQueryParameter("session_id", "STRING", session_id),
+            bigquery.ScalarQueryParameter(
+                "session_id",
+                "STRING",
+                session_id,
+            ),
+            bigquery.ArrayQueryParameter(
+                "event_types",
+                "STRING",
+                self.include_event_types,
+            ),
         ]
     )
 
