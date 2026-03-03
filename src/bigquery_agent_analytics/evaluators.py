@@ -329,6 +329,31 @@ class CodeEvaluator:
     return evaluator
 
   @staticmethod
+  def ttft(
+      threshold_ms: float = 1000.0,
+  ) -> CodeEvaluator:
+    """Pre-built evaluator that checks average time-to-first-token.
+
+    Args:
+        threshold_ms: Maximum acceptable average TTFT in ms.
+
+    Returns:
+        CodeEvaluator configured for TTFT checking.
+    """
+
+    def _score(s: dict[str, Any]) -> float:
+      avg = s.get("avg_ttft_ms", 0) or 0
+      if avg <= 0:
+        return 1.0
+      if avg >= threshold_ms:
+        return 0.0
+      return 1.0 - (avg / threshold_ms)
+
+    evaluator = CodeEvaluator(name="ttft_evaluator")
+    evaluator.add_metric("ttft", _score, threshold=0.5)
+    return evaluator
+
+  @staticmethod
   def cost_per_session(
       max_cost_usd: float = 1.0,
       input_cost_per_1k: float = 0.00025,
@@ -653,12 +678,12 @@ SELECT
   COUNTIF(event_type = 'LLM_REQUEST') AS llm_calls,
   AVG(
     CAST(
-      JSON_EXTRACT_SCALAR(latency_ms, '$.total_ms') AS FLOAT64
+      JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64
     )
   ) AS avg_latency_ms,
   MAX(
     CAST(
-      JSON_EXTRACT_SCALAR(latency_ms, '$.total_ms') AS FLOAT64
+      JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64
     )
   ) AS max_latency_ms,
   TIMESTAMP_DIFF(
@@ -667,37 +692,43 @@ SELECT
   COUNTIF(
     event_type = 'USER_MESSAGE_RECEIVED'
   ) AS turn_count,
+  AVG(
+    CAST(
+      JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64
+    )
+  ) AS avg_ttft_ms,
+  COUNTIF(event_type LIKE 'HITL_%') AS hitl_events,
   COUNTIF(
     ENDS_WITH(event_type, '_ERROR')
     OR error_message IS NOT NULL
     OR status = 'ERROR'
   ) > 0 AS has_error,
   SUM(COALESCE(
-    CAST(JSON_EXTRACT_SCALAR(
+    CAST(JSON_VALUE(
       attributes, '$.usage_metadata.prompt_token_count'
     ) AS INT64),
-    CAST(JSON_EXTRACT_SCALAR(
+    CAST(JSON_VALUE(
       attributes, '$.input_tokens'
     ) AS INT64)
   )) AS input_tokens,
   SUM(COALESCE(
-    CAST(JSON_EXTRACT_SCALAR(
+    CAST(JSON_VALUE(
       attributes, '$.usage_metadata.candidates_token_count'
     ) AS INT64),
-    CAST(JSON_EXTRACT_SCALAR(
+    CAST(JSON_VALUE(
       attributes, '$.output_tokens'
     ) AS INT64)
   )) AS output_tokens,
   SUM(COALESCE(
-    CAST(JSON_EXTRACT_SCALAR(
+    CAST(JSON_VALUE(
       attributes, '$.usage_metadata.total_token_count'
     ) AS INT64),
     COALESCE(
-      CAST(JSON_EXTRACT_SCALAR(
+      CAST(JSON_VALUE(
         attributes, '$.input_tokens'
       ) AS INT64), 0
     ) + COALESCE(
-      CAST(JSON_EXTRACT_SCALAR(
+      CAST(JSON_VALUE(
         attributes, '$.output_tokens'
       ) AS INT64), 0
     )
@@ -716,13 +747,13 @@ WITH session_traces AS (
       CONCAT(
         event_type, ': ',
         COALESCE(
-          JSON_EXTRACT_SCALAR(content, '$.text_summary'), ''
+          JSON_VALUE(content, '$.text_summary'), ''
         )
       ),
       '\\n' ORDER BY timestamp
     ) AS trace_text,
     ARRAY_AGG(
-      JSON_EXTRACT_SCALAR(content, '$.response')
+      JSON_VALUE(content, '$.response')
       IGNORE NULLS
       ORDER BY timestamp DESC
       LIMIT 1
@@ -760,13 +791,13 @@ WITH session_traces AS (
       CONCAT(
         event_type, ': ',
         COALESCE(
-          JSON_EXTRACT_SCALAR(content, '$.text_summary'), ''
+          JSON_VALUE(content, '$.text_summary'), ''
         )
       ),
       '\\n' ORDER BY timestamp
     ) AS trace_text,
     ARRAY_AGG(
-      JSON_EXTRACT_SCALAR(content, '$.response')
+      JSON_VALUE(content, '$.response')
       IGNORE NULLS
       ORDER BY timestamp DESC
       LIMIT 1

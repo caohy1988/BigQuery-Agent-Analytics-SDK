@@ -449,3 +449,67 @@ class TestCostPerSessionPrebuilt:
         }
     )
     assert score.scores["cost"] == 1.0
+
+
+class TestTTFTPrebuilt:
+  """Tests for CodeEvaluator.ttft() preset."""
+
+  def test_zero_ttft(self):
+    evaluator = CodeEvaluator.ttft(threshold_ms=1000)
+    score = evaluator.evaluate_session(
+        {
+            "session_id": "s1",
+            "avg_ttft_ms": 0,
+        }
+    )
+    assert score.scores["ttft"] == 1.0
+    assert score.passed is True
+
+  def test_under_threshold(self):
+    evaluator = CodeEvaluator.ttft(threshold_ms=1000)
+    score = evaluator.evaluate_session(
+        {
+            "session_id": "s1",
+            "avg_ttft_ms": 400,
+        }
+    )
+    assert score.scores["ttft"] == pytest.approx(0.6)
+    assert score.passed is True
+
+  def test_over_threshold(self):
+    evaluator = CodeEvaluator.ttft(threshold_ms=500)
+    score = evaluator.evaluate_session(
+        {
+            "session_id": "s1",
+            "avg_ttft_ms": 800,
+        }
+    )
+    assert score.scores["ttft"] == 0.0
+    assert score.passed is False
+
+  def test_none_ttft_defaults_to_zero(self):
+    evaluator = CodeEvaluator.ttft(threshold_ms=1000)
+    score = evaluator.evaluate_session(
+        {
+            "session_id": "s1",
+            "avg_ttft_ms": None,
+        }
+    )
+    assert score.scores["ttft"] == 1.0
+
+  def test_evaluator_name(self):
+    evaluator = CodeEvaluator.ttft()
+    assert evaluator.name == "ttft_evaluator"
+
+
+class TestSessionSummaryQueryTTFT:
+  """Tests for avg_ttft_ms and hitl_events in SESSION_SUMMARY_QUERY."""
+
+  def test_contains_avg_ttft_ms(self):
+    assert "avg_ttft_ms" in SESSION_SUMMARY_QUERY
+
+  def test_contains_hitl_events(self):
+    assert "hitl_events" in SESSION_SUMMARY_QUERY
+
+  def test_contains_time_to_first_token(self):
+    assert "time_to_first_token_ms" in SESSION_SUMMARY_QUERY

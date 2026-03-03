@@ -108,6 +108,8 @@ class Span:
   session_id: Optional[str] = None
   invocation_id: Optional[str] = None
   user_id: Optional[str] = None
+  trace_id: Optional[str] = None
+  time_to_first_token_ms: Optional[float] = None
 
   @classmethod
   def from_bigquery_row(cls, row: dict[str, Any]) -> Span:
@@ -131,13 +133,16 @@ class Span:
       attributes = {}
 
     latency_ms = row.get("latency_ms")
+    time_to_first_token_ms = None
     if isinstance(latency_ms, str):
       try:
         latency_data = json.loads(latency_ms)
+        time_to_first_token_ms = latency_data.get("time_to_first_token_ms")
         latency_ms = latency_data.get("total_ms")
       except (json.JSONDecodeError, TypeError):
         latency_ms = None
     elif isinstance(latency_ms, dict):
+      time_to_first_token_ms = latency_ms.get("time_to_first_token_ms")
       latency_ms = latency_ms.get("total_ms")
 
     parts_raw = row.get("content_parts", [])
@@ -180,6 +185,8 @@ class Span:
         session_id=row.get("session_id"),
         invocation_id=row.get("invocation_id"),
         user_id=row.get("user_id"),
+        trace_id=row.get("trace_id"),
+        time_to_first_token_ms=time_to_first_token_ms,
     )
 
   @property
@@ -246,6 +253,12 @@ class Span:
       model = self.attributes.get("model", "")
       if model:
         parts.append(f"({model})")
+    elif self.event_type.startswith("HITL_"):
+      tool = self.content.get("tool", "")
+      if tool:
+        parts.append(f"({tool})")
+    elif self.event_type == "STATE_DELTA":
+      pass  # No extra detail needed in label
 
     if self.is_error:
       parts.append("ERROR")
@@ -257,6 +270,37 @@ class Span:
     """Returns a brief content summary for display."""
     if self.error_message:
       return self.error_message[:120]
+
+    # HITL events: show tool name and args/result
+    if self.event_type.startswith("HITL_"):
+      tool = self.content.get("tool", "")
+      if self.event_type.endswith("_COMPLETED"):
+        result = self.content.get("result", "")
+        text = f"{tool}: {result}" if tool else str(result)
+      else:
+        args = self.content.get("args", "")
+        text = f"{tool}: {args}" if tool else str(args)
+      if len(text) > 120:
+        return text[:117] + "..."
+      return text
+
+    # STATE_DELTA: show keys changed
+    # Plugin stores state delta in attributes.state_delta; fall back to
+    # content.delta and then content itself for older formats.
+    if self.event_type == "STATE_DELTA":
+      delta = self.attributes.get("state_delta")
+      if not delta:
+        delta = self.content.get("delta")
+      if not delta:
+        delta = self.content
+      if isinstance(delta, dict):
+        keys = list(delta.keys())
+        if keys:
+          text = f"keys: {', '.join(keys)}"
+          if len(text) > 120:
+            return text[:117] + "..."
+          return text
+      return ""
 
     text = self.content.get("text_summary") or ""
     if not text:
@@ -302,6 +346,8 @@ class TraceFilter:
   min_latency_ms: Optional[float] = None
   max_latency_ms: Optional[float] = None
   event_types: Optional[list[str]] = None
+  tool_origin: Optional[str] = None
+  root_agent_name: Optional[str] = None
   limit: int = 100
 
   def to_sql_conditions(self) -> tuple[str, list]:
@@ -383,7 +429,7 @@ class TraceFilter:
       )
     if self.min_latency_ms is not None:
       conditions.append(
-          "CAST(JSON_EXTRACT_SCALAR(latency_ms, '$.total_ms')"
+          "CAST(JSON_VALUE(latency_ms, '$.total_ms')"
           " AS FLOAT64) >= @min_latency_ms"
       )
       params.append(
@@ -395,7 +441,7 @@ class TraceFilter:
       )
     if self.max_latency_ms is not None:
       conditions.append(
-          "CAST(JSON_EXTRACT_SCALAR(latency_ms, '$.total_ms')"
+          "CAST(JSON_VALUE(latency_ms, '$.total_ms')"
           " AS FLOAT64) <= @max_latency_ms"
       )
       params.append(
@@ -407,7 +453,7 @@ class TraceFilter:
       )
     if self.experiment_id:
       conditions.append(
-          "JSON_EXTRACT_SCALAR(attributes, '$.experiment_id')"
+          "JSON_VALUE(attributes, '$.experiment_id')"
           " = @experiment_id"
       )
       params.append(
@@ -422,7 +468,7 @@ class TraceFilter:
         param_key = f"label_key_{i}"
         param_val = f"label_val_{i}"
         conditions.append(
-            f"JSON_EXTRACT_SCALAR(attributes,"
+            f"JSON_VALUE(attributes,"
             f" CONCAT('$.labels.', @{param_key}))"
             f" = @{param_val}"
         )
@@ -435,6 +481,29 @@ class TraceFilter:
               "event_types",
               "STRING",
               self.event_types,
+          )
+      )
+    if self.tool_origin:
+      conditions.append(
+          "JSON_VALUE(content, '$.tool_origin') = @tool_origin"
+      )
+      params.append(
+          bigquery.ScalarQueryParameter(
+              "tool_origin",
+              "STRING",
+              self.tool_origin,
+          )
+      )
+    if self.root_agent_name:
+      conditions.append(
+          "JSON_VALUE(attributes, '$.root_agent_name')"
+          " = @root_agent_name"
+      )
+      params.append(
+          bigquery.ScalarQueryParameter(
+              "root_agent_name",
+              "STRING",
+              self.root_agent_name,
           )
       )
 

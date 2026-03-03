@@ -192,7 +192,7 @@ hitl_by_type AS (
     COUNT(DISTINCT session_id) AS session_count,
     AVG(
       CAST(
-        JSON_EXTRACT_SCALAR(latency_ms, '$.total_ms') AS FLOAT64
+        JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64
       )
     ) AS avg_latency_ms
   FROM `{project}.{dataset}.{table}`
@@ -1364,6 +1364,8 @@ class Client:
               agents_used=r.get("agents_used") or [],
               tools_used=r.get("tools_used") or [],
               has_error=bool(r.get("has_error")),
+              hitl_events=int(r.get("hitl_events") or 0),
+              state_changes=int(r.get("state_changes") or 0),
               start_time=r.get("start_time"),
               end_time=r.get("end_time"),
           )
