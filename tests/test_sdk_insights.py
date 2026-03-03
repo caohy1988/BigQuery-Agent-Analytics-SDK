@@ -104,6 +104,23 @@ class TestSessionMetadata:
     assert meta.tool_calls == 5
     assert len(meta.agents_used) == 2
 
+  def test_hitl_events_default(self):
+    meta = SessionMetadata(session_id="s1")
+    assert meta.hitl_events == 0
+
+  def test_state_changes_default(self):
+    meta = SessionMetadata(session_id="s1")
+    assert meta.state_changes == 0
+
+  def test_hitl_and_state_change_values(self):
+    meta = SessionMetadata(
+        session_id="s1",
+        hitl_events=3,
+        state_changes=7,
+    )
+    assert meta.hitl_events == 3
+    assert meta.state_changes == 7
+
 
 class TestParseFacetResponse:
   """Tests for parse_facet_response function."""
@@ -719,6 +736,26 @@ class TestParseFacetFromAIGenerateRow:
     assert facet.session_id == "s1"
     assert facet.outcome == "unclear"
     assert facet.goal_categories == ["other"]
+
+
+class TestSessionMetadataQuery:
+  """Tests for _SESSION_METADATA_QUERY SQL template."""
+
+  def test_contains_hitl_events(self):
+    from bigquery_agent_analytics.insights import _SESSION_METADATA_QUERY
+
+    assert "hitl_events" in _SESSION_METADATA_QUERY
+
+  def test_contains_state_changes(self):
+    from bigquery_agent_analytics.insights import _SESSION_METADATA_QUERY
+
+    assert "state_changes" in _SESSION_METADATA_QUERY
+
+  def test_uses_json_value(self):
+    from bigquery_agent_analytics.insights import _SESSION_METADATA_QUERY
+
+    assert "JSON_VALUE" in _SESSION_METADATA_QUERY
+    assert "JSON_EXTRACT_SCALAR" not in _SESSION_METADATA_QUERY
 
 
 class TestAIGenerateTemplates:

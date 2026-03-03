@@ -648,3 +648,166 @@ class TestEventTypeEnum:
         "HITL_CREDENTIAL_REQUEST"
     )
     assert EventType.HITL_INPUT_REQUEST.value == ("HITL_INPUT_REQUEST")
+
+
+class TestSpanNewFields:
+  """Tests for new Span fields: trace_id and time_to_first_token_ms."""
+
+  def test_from_bigquery_row_with_trace_id(self):
+    row = {
+        "event_type": "LLM_RESPONSE",
+        "agent": "agent",
+        "timestamp": datetime.now(timezone.utc),
+        "content": "{}",
+        "attributes": "{}",
+        "trace_id": "trace-abc-123",
+        "status": "OK",
+    }
+    span = Span.from_bigquery_row(row)
+    assert span.trace_id == "trace-abc-123"
+
+  def test_from_bigquery_row_time_to_first_token_json_string(self):
+    row = {
+        "event_type": "LLM_RESPONSE",
+        "agent": "agent",
+        "timestamp": datetime.now(timezone.utc),
+        "content": None,
+        "attributes": None,
+        "latency_ms": '{"total_ms": 500, "time_to_first_token_ms": 120}',
+        "status": "OK",
+    }
+    span = Span.from_bigquery_row(row)
+    assert span.latency_ms == 500
+    assert span.time_to_first_token_ms == 120
+
+  def test_from_bigquery_row_time_to_first_token_dict(self):
+    row = {
+        "event_type": "LLM_RESPONSE",
+        "agent": "agent",
+        "timestamp": datetime.now(timezone.utc),
+        "content": None,
+        "attributes": None,
+        "latency_ms": {"total_ms": 300, "time_to_first_token_ms": 80},
+        "status": "OK",
+    }
+    span = Span.from_bigquery_row(row)
+    assert span.latency_ms == 300
+    assert span.time_to_first_token_ms == 80
+
+  def test_from_bigquery_row_no_ttft(self):
+    row = {
+        "event_type": "LLM_RESPONSE",
+        "agent": "agent",
+        "timestamp": datetime.now(timezone.utc),
+        "content": None,
+        "attributes": None,
+        "latency_ms": '{"total_ms": 200}',
+        "status": "OK",
+    }
+    span = Span.from_bigquery_row(row)
+    assert span.latency_ms == 200
+    assert span.time_to_first_token_ms is None
+
+
+class TestHITLAndStateDeltaLabelSummary:
+  """Tests for HITL and STATE_DELTA label and summary."""
+
+  def test_hitl_request_label(self):
+    span = Span(
+        event_type="HITL_CONFIRMATION_REQUEST",
+        agent="agent",
+        timestamp=datetime.now(timezone.utc),
+        content={"tool": "approve_payment", "args": {"amount": 100}},
+    )
+    assert "HITL_CONFIRMATION_REQUEST" in span.label
+    assert "(approve_payment)" in span.label
+
+  def test_hitl_completed_label(self):
+    span = Span(
+        event_type="HITL_CONFIRMATION_REQUEST_COMPLETED",
+        agent="agent",
+        timestamp=datetime.now(timezone.utc),
+        content={"tool": "approve_payment", "result": "approved"},
+    )
+    assert "HITL_CONFIRMATION_REQUEST_COMPLETED" in span.label
+    assert "(approve_payment)" in span.label
+
+  def test_hitl_request_summary(self):
+    span = Span(
+        event_type="HITL_INPUT_REQUEST",
+        agent="agent",
+        timestamp=datetime.now(timezone.utc),
+        content={"tool": "get_user_input", "args": {"prompt": "Enter name"}},
+    )
+    assert "get_user_input" in span.summary
+    assert "prompt" in span.summary
+
+  def test_hitl_completed_summary(self):
+    span = Span(
+        event_type="HITL_INPUT_REQUEST_COMPLETED",
+        agent="agent",
+        timestamp=datetime.now(timezone.utc),
+        content={"tool": "get_user_input", "result": "John Doe"},
+    )
+    assert "get_user_input" in span.summary
+    assert "John Doe" in span.summary
+
+  def test_state_delta_label(self):
+    span = Span(
+        event_type="STATE_DELTA",
+        agent="agent",
+        timestamp=datetime.now(timezone.utc),
+        content={"delta": {"counter": 5, "status": "running"}},
+    )
+    assert "STATE_DELTA" in span.label
+
+  def test_state_delta_summary_with_delta_key(self):
+    span = Span(
+        event_type="STATE_DELTA",
+        agent="agent",
+        timestamp=datetime.now(timezone.utc),
+        content={"delta": {"counter": 5, "status": "running"}},
+    )
+    assert "counter" in span.summary
+    assert "status" in span.summary
+
+  def test_state_delta_summary_flat_content(self):
+    span = Span(
+        event_type="STATE_DELTA",
+        agent="agent",
+        timestamp=datetime.now(timezone.utc),
+        content={"progress": 50, "phase": "analysis"},
+    )
+    assert "progress" in span.summary
+    assert "phase" in span.summary
+
+
+class TestTraceFilterNewFields:
+  """Tests for new TraceFilter fields: tool_origin and root_agent_name."""
+
+  def test_tool_origin_filter(self):
+    filt = TraceFilter(tool_origin="MCP")
+    where, params = filt.to_sql_conditions()
+    assert "tool_origin" in where
+    assert "@tool_origin" in where
+    param_names = [p.name for p in params]
+    assert "tool_origin" in param_names
+
+  def test_root_agent_name_filter(self):
+    filt = TraceFilter(root_agent_name="my_root_agent")
+    where, params = filt.to_sql_conditions()
+    assert "root_agent_name" in where
+    assert "@root_agent_name" in where
+    param_names = [p.name for p in params]
+    assert "root_agent_name" in param_names
+
+  def test_combined_with_existing_filters(self):
+    filt = TraceFilter(
+        agent_id="agent",
+        tool_origin="LOCAL",
+        root_agent_name="root",
+    )
+    where, _ = filt.to_sql_conditions()
+    assert "agent = @agent_id" in where
+    assert "tool_origin" in where
+    assert "root_agent_name" in where

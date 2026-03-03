@@ -187,6 +187,8 @@ class SessionMetadata(BaseModel):
   agents_used: list[str] = Field(default_factory=list)
   tools_used: list[str] = Field(default_factory=list)
   has_error: bool = Field(default=False)
+  hitl_events: int = Field(default=0)
+  state_changes: int = Field(default=0)
   start_time: Optional[datetime] = None
   end_time: Optional[datetime] = None
 
@@ -386,7 +388,7 @@ SELECT
   ) AS total_latency_ms,
   AVG(
     CAST(
-      JSON_EXTRACT_SCALAR(latency_ms, '$.total_ms')
+      JSON_VALUE(latency_ms, '$.total_ms')
       AS FLOAT64
     )
   ) AS avg_latency_ms,
@@ -394,7 +396,7 @@ SELECT
     DISTINCT agent IGNORE NULLS
   ) AS agents_used,
   ARRAY_AGG(
-    DISTINCT JSON_EXTRACT_SCALAR(content, '$.tool')
+    DISTINCT JSON_VALUE(content, '$.tool')
     IGNORE NULLS
   ) AS tools_used,
   COUNTIF(
@@ -402,6 +404,8 @@ SELECT
     OR error_message IS NOT NULL
     OR status = 'ERROR'
   ) > 0 AS has_error,
+  COUNTIF(event_type LIKE 'HITL_%') AS hitl_events,
+  COUNTIF(event_type = 'STATE_DELTA') AS state_changes,
   MIN(timestamp) AS start_time,
   MAX(timestamp) AS end_time
 FROM `{project}.{dataset}.{table}`
@@ -422,9 +426,9 @@ SELECT
       COALESCE(CONCAT(' [', agent, ']'), ''),
       ': ',
       COALESCE(
-        JSON_EXTRACT_SCALAR(content, '$.text_summary'),
-        JSON_EXTRACT_SCALAR(content, '$.response'),
-        JSON_EXTRACT_SCALAR(content, '$.tool'),
+        JSON_VALUE(content, '$.text_summary'),
+        JSON_VALUE(content, '$.response'),
+        JSON_VALUE(content, '$.tool'),
         CAST(status AS STRING),
         ''
       )
@@ -432,7 +436,7 @@ SELECT
     '\\n' ORDER BY timestamp
   ) AS transcript,
   ARRAY_AGG(
-    JSON_EXTRACT_SCALAR(content, '$.response')
+    JSON_VALUE(content, '$.response')
     IGNORE NULLS
     ORDER BY timestamp DESC
     LIMIT 1
@@ -452,9 +456,9 @@ WITH transcripts AS (
         COALESCE(CONCAT(' [', agent, ']'), ''),
         ': ',
         COALESCE(
-          JSON_EXTRACT_SCALAR(content, '$.text_summary'),
-          JSON_EXTRACT_SCALAR(content, '$.response'),
-          JSON_EXTRACT_SCALAR(content, '$.tool'),
+          JSON_VALUE(content, '$.text_summary'),
+          JSON_VALUE(content, '$.response'),
+          JSON_VALUE(content, '$.tool'),
           ''
         )
       ),
@@ -509,9 +513,9 @@ WITH transcripts AS (
         COALESCE(CONCAT(' [', agent, ']'), ''),
         ': ',
         COALESCE(
-          JSON_EXTRACT_SCALAR(content, '$.text_summary'),
-          JSON_EXTRACT_SCALAR(content, '$.response'),
-          JSON_EXTRACT_SCALAR(content, '$.tool'),
+          JSON_VALUE(content, '$.text_summary'),
+          JSON_VALUE(content, '$.response'),
+          JSON_VALUE(content, '$.tool'),
           ''
         )
       ),
