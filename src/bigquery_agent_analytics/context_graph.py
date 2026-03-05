@@ -99,6 +99,8 @@ class BizNode:
   node_type: str
   node_value: str
   confidence: float = 1.0
+  evaluated_at: Optional[datetime] = None
+  artifact_uri: Optional[str] = None
   metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -203,6 +205,17 @@ class ContextGraphConfig(BaseModel):
 
 
 # ------------------------------------------------------------------ #
+# Constants                                                             #
+# ------------------------------------------------------------------ #
+
+_BIZ_NODE_OUTPUT_SCHEMA = (
+    '{"type": "ARRAY", "items": {"type": "OBJECT", "properties": '
+    '{"entity_type": {"type": "STRING"}, '
+    '"entity_value": {"type": "STRING"}, '
+    '"confidence": {"type": "NUMBER"}}}}'
+)
+
+# ------------------------------------------------------------------ #
 # SQL Templates                                                        #
 # ------------------------------------------------------------------ #
 
@@ -220,7 +233,14 @@ USING (
     CAST(
       COALESCE(JSON_EXTRACT_SCALAR(entity, '$.confidence'), '1.0')
       AS FLOAT64
-    ) AS confidence
+    ) AS confidence,
+    -- Persisted artifact URI from content_parts[].object_ref.uri
+    (SELECT JSON_EXTRACT_SCALAR(cp, '$.object_ref.uri')
+     FROM UNNEST(JSON_EXTRACT_ARRAY(TO_JSON_STRING(base.content_parts)))
+       AS cp WITH OFFSET
+     WHERE JSON_EXTRACT_SCALAR(cp, '$.object_ref.uri') IS NOT NULL
+     ORDER BY OFFSET LIMIT 1
+    ) AS artifact_uri
   FROM `{project}.{dataset}.{table}` AS base,
   UNNEST(JSON_EXTRACT_ARRAY(
     -- Strip markdown code fences (```json ... ```) from LLM output
@@ -230,9 +250,8 @@ USING (
           CONCAT(
             'Extract business entities from this agent payload. ',
             'Entity types: {entity_types}. ',
-            'Return ONLY a JSON array of objects with entity_type, ',
-            'entity_value, and confidence (0-1). ',
-            'No markdown, no explanation, just the JSON array.',
+            'Return a JSON array of objects with entity_type, ',
+            'entity_value, and confidence (0-1).',
             '\\n\\nPayload:\\n',
             COALESCE(
               JSON_EXTRACT_SCALAR(base.content, '$.text_summary'),
@@ -241,7 +260,8 @@ USING (
               TO_JSON_STRING(base.content)
             )
           ),
-          endpoint => '{endpoint}'
+          endpoint => '{endpoint}',
+          output_schema => '{output_schema}'
         ).result,
         r'^```(?:json)?\\s*', ''),
       r'\\s*```$', '')
@@ -257,11 +277,14 @@ USING (
 ) AS source
 ON target.biz_node_id = source.biz_node_id
 WHEN MATCHED THEN
-  UPDATE SET confidence = source.confidence
+  UPDATE SET confidence = source.confidence,
+             artifact_uri = source.artifact_uri
 WHEN NOT MATCHED THEN
-  INSERT (biz_node_id, span_id, session_id, node_type, node_value, confidence)
+  INSERT (biz_node_id, span_id, session_id, node_type, node_value,
+          confidence, artifact_uri)
   VALUES (source.biz_node_id, source.span_id, source.session_id,
-          source.node_type, source.node_value, source.confidence)
+          source.node_type, source.node_value, source.confidence,
+          source.artifact_uri)
 """
 
 _EXTRACT_BIZ_NODES_SIMPLE_QUERY = """\
@@ -294,7 +317,8 @@ CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{biz_table}` (
   session_id STRING,
   node_type STRING,
   node_value STRING,
-  confidence FLOAT64
+  confidence FLOAT64,
+  artifact_uri STRING
 )
 """
 
@@ -313,6 +337,7 @@ CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{cross_links_table}` (
   biz_node_id STRING,
   node_value STRING,
   link_type STRING,
+  artifact_uri STRING,
   created_at TIMESTAMP
 )
 """
@@ -324,7 +349,8 @@ WHERE session_id IN UNNEST(@session_ids)
 
 _INSERT_CROSS_LINKS_QUERY = """\
 INSERT INTO `{project}.{dataset}.{cross_links_table}`
-  (link_id, span_id, session_id, biz_node_id, node_value, link_type, created_at)
+  (link_id, span_id, session_id, biz_node_id, node_value, link_type,
+   artifact_uri, created_at)
 SELECT
   CONCAT(b.span_id, ':', b.node_value) AS link_id,
   b.span_id,
@@ -332,6 +358,7 @@ SELECT
   b.biz_node_id,
   b.node_value,
   'EVALUATED' AS link_type,
+  b.artifact_uri,
   CURRENT_TIMESTAMP() AS created_at
 FROM `{project}.{dataset}.{biz_table}` b
 WHERE b.session_id IN UNNEST(@session_ids)
@@ -364,7 +391,8 @@ CREATE OR REPLACE PROPERTY GRAPH `{project}.{dataset}.{graph_name}`
         node_value,
         confidence,
         session_id,
-        span_id
+        span_id,
+        artifact_uri
       )
   )
   EDGE TABLES (
@@ -381,6 +409,11 @@ CREATE OR REPLACE PROPERTY GRAPH `{project}.{dataset}.{graph_name}`
       SOURCE KEY (span_id) REFERENCES TechNode (span_id)
       DESTINATION KEY (biz_node_id) REFERENCES BizNode (biz_node_id)
       LABEL Evaluated
+      PROPERTIES (
+        artifact_uri,
+        link_type,
+        created_at
+      )
   )
 """
 
@@ -434,6 +467,36 @@ RETURN
   TO_JSON(leaf) AS leaf_node,
   TO_JSON(c) AS edge
 ORDER BY leaf.timestamp ASC
+LIMIT @result_limit
+"""
+
+_GQL_TRACE_RECONSTRUCTION_QUERY = """\
+GRAPH `{project}.{dataset}.{graph_name}`
+MATCH
+  (parent:TechNode)-[c:Caused]->(child:TechNode)
+WHERE parent.session_id = @session_id
+   OR child.session_id = @session_id
+RETURN
+  parent.span_id AS parent_span_id,
+  parent.event_type AS parent_event_type,
+  parent.agent AS parent_agent,
+  parent.timestamp AS parent_timestamp,
+  parent.session_id AS session_id,
+  parent.invocation_id AS parent_invocation_id,
+  parent.content AS parent_content,
+  parent.latency_ms AS parent_latency_ms,
+  parent.status AS parent_status,
+  parent.error_message AS parent_error_message,
+  child.span_id AS child_span_id,
+  child.event_type AS child_event_type,
+  child.agent AS child_agent,
+  child.timestamp AS child_timestamp,
+  child.invocation_id AS child_invocation_id,
+  child.content AS child_content,
+  child.latency_ms AS child_latency_ms,
+  child.status AS child_status,
+  child.error_message AS child_error_message
+ORDER BY child.timestamp ASC
 LIMIT @result_limit
 """
 
@@ -578,6 +641,7 @@ class ContextGraphManager:
         biz_table=self.config.biz_nodes_table,
         endpoint=self._resolve_endpoint(),
         entity_types=entity_types_str,
+        output_schema=_BIZ_NODE_OUTPUT_SCHEMA,
     )
 
     job_config = bigquery.QueryJobConfig(
@@ -1015,6 +1079,58 @@ class ContextGraphManager:
       return []
 
   # -------------------------------------------------------------- #
+  # GQL Trace Reconstruction                                         #
+  # -------------------------------------------------------------- #
+
+  def reconstruct_trace_gql(
+      self,
+      session_id: str,
+      graph_name: Optional[str] = None,
+      result_limit: int = 1000,
+  ) -> list[dict[str, Any]]:
+    """Reconstructs a session trace using GQL graph traversal.
+
+    This replaces the recursive CTE approach in ``trace.py`` with
+    a native Property Graph ``MATCH`` query that walks the
+    ``Caused`` edges to reconstruct the parent→child span tree.
+
+    Args:
+        session_id: Session to reconstruct.
+        graph_name: Override graph name.
+        result_limit: Maximum result rows.
+
+    Returns:
+        List of dicts with parent/child span pairs ordered by
+        timestamp, suitable for building a Trace tree.
+    """
+    gname = graph_name or self.config.graph_name
+    query = _GQL_TRACE_RECONSTRUCTION_QUERY.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        graph_name=gname,
+        table=self.table_id,
+    )
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "session_id", "STRING", session_id
+            ),
+            bigquery.ScalarQueryParameter(
+                "result_limit", "INT64", result_limit
+            ),
+        ]
+    )
+
+    try:
+      job = self.client.query(query, job_config=job_config)
+      rows = list(job.result())
+      return [dict(row) for row in rows]
+    except Exception as e:
+      logger.warning("GQL trace reconstruction failed: %s", e)
+      return []
+
+  # -------------------------------------------------------------- #
   # World Change Detection                                           #
   # -------------------------------------------------------------- #
 
@@ -1063,6 +1179,50 @@ class ContextGraphManager:
       )
       return []
 
+  def _get_biz_nodes_with_timestamp(
+      self, session_id: str
+  ) -> list[BizNode]:
+    """Returns biz nodes with ``evaluated_at`` timestamp from the events table.
+
+    Uses ``_WORLD_CHANGE_CHECK_QUERY`` which JOINs biz_nodes with
+    agent_events to get the original evaluation timestamp.
+    """
+    query = _WORLD_CHANGE_CHECK_QUERY.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        biz_table=self.config.biz_nodes_table,
+        table=self.table_id,
+    )
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "session_id", "STRING", session_id
+            ),
+        ]
+    )
+
+    try:
+      job = self.client.query(query, job_config=job_config)
+      rows = list(job.result())
+      return [
+          BizNode(
+              span_id=row.get("span_id", ""),
+              session_id=session_id,
+              node_type=row.get("node_type", ""),
+              node_value=row.get("node_value", ""),
+              confidence=float(row.get("confidence", 1.0)),
+              evaluated_at=row.get("evaluated_at"),
+          )
+          for row in rows
+      ]
+    except Exception as e:
+      logger.warning(
+          "Failed to get timestamped biz nodes for session %s: %s",
+          session_id, e,
+      )
+      return []
+
   def detect_world_changes(
       self,
       session_id: str,
@@ -1073,8 +1233,13 @@ class ContextGraphManager:
     This implements the "World Change" detection pattern for
     long-running A2A tasks. Before a HITL approval is finalized,
     this method traverses the context graph to find the original
-    BizNodes, queries current availability via *current_state_fn*,
-    and reports any drift.
+    BizNodes with their ``evaluated_at`` timestamps, then queries
+    current availability via *current_state_fn* and reports drift.
+
+    The callback receives a :class:`BizNode` whose ``evaluated_at``
+    field contains the original evaluation timestamp, enabling
+    temporal drift comparisons (e.g. "was this still available
+    2 hours after evaluation?").
 
     Args:
         session_id: The session to check.
@@ -1087,7 +1252,7 @@ class ContextGraphManager:
     Returns:
         WorldChangeReport with alerts for any detected drift.
     """
-    nodes = self.get_biz_nodes_for_session(session_id)
+    nodes = self._get_biz_nodes_with_timestamp(session_id)
 
     alerts: list[WorldChangeAlert] = []
     stale_count = 0

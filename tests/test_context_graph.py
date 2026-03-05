@@ -326,27 +326,29 @@ class TestContextGraphManager:
   def test_detect_world_changes_with_drift(self):
     mock_client = MagicMock()
     mock_job = MagicMock()
-    # Simulate returned biz nodes
+    # Simulate returned biz nodes with evaluated_at timestamps
     mock_job.result.return_value = [
         {
             "span_id": "s1",
-            "session_id": "sess-1",
             "node_type": "Product",
             "node_value": "Yahoo Homepage",
             "confidence": 0.95,
+            "evaluated_at": datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc),
         },
         {
             "span_id": "s2",
-            "session_id": "sess-1",
             "node_type": "Targeting",
             "node_value": "Millennials",
             "confidence": 0.90,
+            "evaluated_at": datetime(2025, 6, 1, 12, 1, tzinfo=timezone.utc),
         },
     ]
     mock_client.query.return_value = mock_job
     mgr = self._make_manager(mock_client)
 
     def check_state(node):
+      # Verify evaluated_at timestamp is passed through
+      assert node.evaluated_at is not None
       if node.node_value == "Yahoo Homepage":
         return {
             "available": False,
@@ -372,10 +374,10 @@ class TestContextGraphManager:
     mock_job.result.return_value = [
         {
             "span_id": "s1",
-            "session_id": "sess-1",
             "node_type": "Product",
             "node_value": "Test",
             "confidence": 1.0,
+            "evaluated_at": datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc),
         },
     ]
     mock_client.query.return_value = mock_job
@@ -443,6 +445,111 @@ class TestContextGraphManager:
 
     result = mgr.traverse_causal_chain(session_id="sess-1")
     assert result == []
+
+  def test_extract_query_has_output_schema(self):
+    mgr = self._make_manager()
+    from bigquery_agent_analytics.context_graph import (
+        _BIZ_NODE_OUTPUT_SCHEMA,
+        _EXTRACT_BIZ_NODES_QUERY,
+    )
+    assert "output_schema =>" in _EXTRACT_BIZ_NODES_QUERY
+    assert "entity_type" in _BIZ_NODE_OUTPUT_SCHEMA
+    assert "entity_value" in _BIZ_NODE_OUTPUT_SCHEMA
+    assert "confidence" in _BIZ_NODE_OUTPUT_SCHEMA
+
+  def test_property_graph_ddl_has_artifact_uri(self):
+    mgr = self._make_manager()
+    ddl = mgr.get_property_graph_ddl()
+    assert "artifact_uri" in ddl
+
+  def test_property_graph_ddl_evaluated_has_properties(self):
+    mgr = self._make_manager()
+    ddl = mgr.get_property_graph_ddl()
+    assert "link_type" in ddl
+    assert "created_at" in ddl
+
+  def test_reconstruct_trace_gql_success(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "parent_span_id": "s1",
+            "parent_event_type": "USER_MESSAGE_RECEIVED",
+            "parent_agent": "root",
+            "parent_timestamp": datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc),
+            "session_id": "sess-1",
+            "parent_invocation_id": "inv-1",
+            "parent_content": {},
+            "parent_latency_ms": None,
+            "parent_status": "OK",
+            "parent_error_message": None,
+            "child_span_id": "s2",
+            "child_event_type": "LLM_REQUEST",
+            "child_agent": "root",
+            "child_timestamp": datetime(2025, 6, 1, 12, 1, tzinfo=timezone.utc),
+            "child_invocation_id": "inv-1",
+            "child_content": {},
+            "child_latency_ms": 500,
+            "child_status": "OK",
+            "child_error_message": None,
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    rows = mgr.reconstruct_trace_gql(session_id="sess-1")
+    assert len(rows) == 1
+    assert rows[0]["parent_span_id"] == "s1"
+    assert rows[0]["child_span_id"] == "s2"
+
+  def test_reconstruct_trace_gql_failure(self):
+    mock_client = MagicMock()
+    mock_client.query.side_effect = Exception("GQL error")
+    mgr = self._make_manager(mock_client)
+
+    result = mgr.reconstruct_trace_gql(session_id="sess-1")
+    assert result == []
+
+  def test_biz_node_has_evaluated_at_and_artifact_uri(self):
+    node = BizNode(
+        span_id="s1",
+        session_id="sess-1",
+        node_type="Product",
+        node_value="Yahoo Homepage",
+        evaluated_at=datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc),
+        artifact_uri="gs://bucket/path/file.json",
+    )
+    assert node.evaluated_at is not None
+    assert node.artifact_uri == "gs://bucket/path/file.json"
+
+  def test_detect_world_changes_passes_evaluated_at(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    eval_time = datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc)
+    mock_job.result.return_value = [
+        {
+            "span_id": "s1",
+            "node_type": "Product",
+            "node_value": "Test",
+            "confidence": 1.0,
+            "evaluated_at": eval_time,
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    received_timestamps = []
+
+    def check_fn(node):
+      received_timestamps.append(node.evaluated_at)
+      return {"available": True, "current_value": node.node_value}
+
+    mgr.detect_world_changes(
+        session_id="sess-1",
+        current_state_fn=check_fn,
+    )
+    assert len(received_timestamps) == 1
+    assert received_timestamps[0] == eval_time
 
 
 # ------------------------------------------------------------------ #

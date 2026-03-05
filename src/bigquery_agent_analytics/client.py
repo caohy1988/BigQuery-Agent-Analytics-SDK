@@ -1693,6 +1693,89 @@ class Client:
         location=self.location,
     )
 
+  def get_session_trace_gql(
+      self,
+      session_id: str,
+      config: Optional[Any] = None,
+  ) -> Trace:
+    """Reconstructs a session trace using GQL graph traversal.
+
+    This is the Property Graph alternative to :meth:`get_session_trace`.
+    Instead of a flat SQL query, it walks the ``Caused`` edges in the
+    Property Graph to reconstruct the parent→child span tree natively.
+
+    Requires a Property Graph to have been created via
+    :meth:`ContextGraphManager.create_property_graph`.
+
+    Args:
+        session_id: The session ID to reconstruct.
+        config: Optional :class:`ContextGraphConfig`.
+
+    Returns:
+        A Trace object with all spans for the session.
+
+    Raises:
+        ValueError: If no events found for the session ID.
+    """
+    mgr = self.context_graph(config=config)
+    rows = mgr.reconstruct_trace_gql(session_id=session_id)
+
+    if not rows:
+      raise ValueError(
+          f"No GQL results for session_id={session_id}. "
+          "Ensure the Property Graph exists."
+      )
+
+    # Deduplicate spans from parent/child pairs
+    seen: dict[str, dict[str, Any]] = {}
+    for row in rows:
+      for prefix in ("parent_", "child_"):
+        sid = row.get(f"{prefix}span_id")
+        if sid and sid not in seen:
+          seen[sid] = {
+              "span_id": sid,
+              "event_type": row.get(f"{prefix}event_type", "UNKNOWN"),
+              "agent": row.get(f"{prefix}agent"),
+              "timestamp": row.get(f"{prefix}timestamp"),
+              "session_id": row.get("session_id"),
+              "invocation_id": row.get(f"{prefix}invocation_id"),
+              "content": row.get(f"{prefix}content") or {},
+              "latency_ms": row.get(f"{prefix}latency_ms"),
+              "status": row.get(f"{prefix}status", "OK"),
+              "error_message": row.get(f"{prefix}error_message"),
+              "parent_span_id": (
+                  row.get("parent_span_id")
+                  if prefix == "child_" else None
+              ),
+          }
+
+    spans = [Span.from_bigquery_row(v) for v in seen.values()]
+
+    user_id = None
+    trace_id = None
+    for s in spans:
+      if not user_id:
+        user_id = s.user_id
+      if not trace_id:
+        trace_id = s.trace_id
+
+    timestamps = [s.timestamp for s in spans if s.timestamp]
+    start = min(timestamps) if timestamps else None
+    end = max(timestamps) if timestamps else None
+    total_ms = None
+    if start and end:
+      total_ms = (end - start).total_seconds() * 1000
+
+    return Trace(
+        trace_id=trace_id or session_id,
+        session_id=session_id,
+        spans=spans,
+        user_id=user_id,
+        start_time=start,
+        end_time=end,
+        total_latency_ms=total_ms,
+    )
+
 
 # ------------------------------------------------------------------ #
 # Helpers                                                              #
