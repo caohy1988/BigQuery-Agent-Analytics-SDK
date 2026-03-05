@@ -151,6 +151,14 @@ class WorldChangeReport(BaseModel):
   total_entities_checked: int = Field(default=0)
   stale_entities: int = Field(default=0)
   is_safe_to_approve: bool = Field(default=True)
+  check_failed: bool = Field(
+      default=False,
+      description=(
+          "True when the underlying query or state check could "
+          "not complete.  When True, is_safe_to_approve=False "
+          "and the report should NOT be used for HITL approval."
+      ),
+  )
   checked_at: datetime = Field(
       default_factory=lambda: datetime.now(timezone.utc)
   )
@@ -165,6 +173,8 @@ class WorldChangeReport(BaseModel):
         f"  Stale entities   : {self.stale_entities}",
         f"  Safe to approve  : {self.is_safe_to_approve}",
     ]
+    if self.check_failed:
+      lines.append("  CHECK FAILED     : query or state check error")
     for alert in self.alerts:
       lines.append(
           f"  [{alert.drift_type}] {alert.biz_node}: "
@@ -583,10 +593,22 @@ class ContextGraphManager:
     Short model names like ``gemini-2.5-flash`` work for older models,
     but newer models (Gemini 3.x+) require the full Vertex AI endpoint
     URL.  This method converts short names to full URLs when necessary.
+
+    Raises:
+        ValueError: If the endpoint looks like a legacy BQ ML model
+            reference (``project.dataset.model``), which is not
+            compatible with AI.GENERATE.
     """
     ep = self.config.endpoint
     if ep.startswith("https://"):
       return ep
+    # Reject legacy BQ ML model refs (project.dataset.model)
+    if ep.count(".") >= 2:
+      raise ValueError(
+          f"Legacy BQ ML model reference '{ep}' is not supported "
+          f"for AI.GENERATE. Use a Vertex AI model name "
+          f"(e.g. 'gemini-2.5-flash') or a full endpoint URL."
+      )
     return (
         f"https://aiplatform.googleapis.com/v1/projects/"
         f"{self.project_id}/locations/global/publishers/google/"
@@ -1234,7 +1256,7 @@ class ContextGraphManager:
           "Failed to get timestamped biz nodes for session %s: %s",
           session_id, e,
       )
-      return []
+      raise
 
   def detect_world_changes(
       self,
@@ -1264,8 +1286,17 @@ class ContextGraphManager:
 
     Returns:
         WorldChangeReport with alerts for any detected drift.
+        When the underlying query fails, ``check_failed`` is True
+        and ``is_safe_to_approve`` is False (fail-closed).
     """
-    nodes = self._get_biz_nodes_with_timestamp(session_id)
+    try:
+      nodes = self._get_biz_nodes_with_timestamp(session_id)
+    except Exception:
+      return WorldChangeReport(
+          session_id=session_id,
+          is_safe_to_approve=False,
+          check_failed=True,
+      )
 
     alerts: list[WorldChangeAlert] = []
     stale_count = 0

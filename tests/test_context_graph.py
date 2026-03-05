@@ -200,6 +200,14 @@ class TestContextGraphManager:
     assert ep.startswith("https://")
     assert "gemini-3-flash-preview" in ep
 
+  def test_resolve_endpoint_rejects_legacy_ref(self):
+    mgr = self._make_manager()
+    mgr.config = ContextGraphConfig(
+        endpoint="my-project.my_dataset.my_model"
+    )
+    with pytest.raises(ValueError, match="Legacy BQ ML"):
+      mgr._resolve_endpoint()
+
   def test_get_property_graph_ddl(self):
     mgr = self._make_manager()
     ddl = mgr.get_property_graph_ddl()
@@ -393,6 +401,16 @@ class TestContextGraphManager:
     # Should not crash; entity is skipped
     assert report.is_safe_to_approve
     assert report.stale_entities == 0
+
+  def test_detect_world_changes_query_failure_is_fail_closed(self):
+    mock_client = MagicMock()
+    mock_client.query.side_effect = Exception("BigQuery unavailable")
+    mgr = self._make_manager(mock_client)
+
+    report = mgr.detect_world_changes(session_id="sess-1")
+    assert not report.is_safe_to_approve
+    assert report.check_failed is True
+    assert "CHECK FAILED" in report.summary()
 
   def test_create_cross_links_success(self):
     mock_client = MagicMock()

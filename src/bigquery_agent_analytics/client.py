@@ -46,6 +46,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+from datetime import datetime
+from datetime import timezone
 import logging
 from typing import Any, Optional
 
@@ -1769,9 +1771,11 @@ class Client:
       if span.span_id and span.span_id not in gql_span_ids:
         gql_spans.append(span)
 
-    # Sort by timestamp for deterministic chronological order
+    # Sort by timestamp for deterministic chronological order.
+    # Use epoch as fallback (timezone-aware to avoid naive/aware conflicts).
+    _epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     gql_spans.sort(
-        key=lambda s: (s.timestamp or datetime.min, s.span_id or "")
+        key=lambda s: (s.timestamp or _epoch, s.span_id or "")
     )
 
     spans = gql_spans
