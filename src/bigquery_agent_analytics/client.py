@@ -1659,6 +1659,40 @@ class Client:
         text_model=model,
     )
 
+  # -------------------------------------------------------------- #
+  # Context Graph                                                    #
+  # -------------------------------------------------------------- #
+
+  def context_graph(
+      self,
+      config: Optional[Any] = None,
+  ) -> Any:
+    """Returns a :class:`ContextGraphManager` bound to this client.
+
+    The manager provides Property Graph DDL generation, business
+    entity extraction via ``AI.GENERATE``, GQL traversal, and
+    world-change detection.
+
+    Args:
+        config: Optional :class:`ContextGraphConfig`. When *None*,
+            default settings are used.
+
+    Returns:
+        A :class:`ContextGraphManager` instance.
+    """
+    from .context_graph import ContextGraphConfig
+    from .context_graph import ContextGraphManager
+
+    cfg = config or ContextGraphConfig(endpoint=self.endpoint)
+    return ContextGraphManager(
+        project_id=self.project_id,
+        dataset_id=self.dataset_id,
+        table_id=self.table_id,
+        config=cfg,
+        client=self.bq_client,
+        location=self.location,
+    )
+
 
 # ------------------------------------------------------------------ #
 # Helpers                                                              #
