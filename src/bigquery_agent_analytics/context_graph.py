@@ -780,6 +780,7 @@ class ContextGraphManager:
             "node_type": n.node_type,
             "node_value": n.node_value,
             "confidence": n.confidence,
+            "artifact_uri": n.artifact_uri,
         }
         for n in nodes
     ]
@@ -845,8 +846,13 @@ class ContextGraphManager:
       )
       job = self.client.query(delete_query, job_config=job_config)
       job.result()
-    except Exception:
-      pass  # table may be empty or not exist yet
+    except Exception as e:
+      err_msg = str(e).lower()
+      if "not found" in err_msg or "does not exist" in err_msg:
+        logger.debug("Cross-links table does not exist yet: %s", e)
+      else:
+        logger.warning("Cross-links delete failed: %s", e)
+        return False
 
     insert_query = _INSERT_CROSS_LINKS_QUERY.format(
         project=self.project_id,

@@ -605,6 +605,65 @@ class TestContextGraphManager:
     assert "WHEN NOT MATCHED BY SOURCE" in _EXTRACT_BIZ_NODES_QUERY
     assert "DELETE" in _EXTRACT_BIZ_NODES_QUERY
 
+  def test_store_biz_nodes_persists_artifact_uri(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_client.query.return_value = mock_job
+    mock_client.insert_rows_json.return_value = []
+    mgr = self._make_manager(mock_client)
+
+    nodes = [
+        BizNode(
+            span_id="s1",
+            session_id="sess-1",
+            node_type="Product",
+            node_value="Homepage",
+            artifact_uri="gs://bucket/artifact.json",
+        ),
+    ]
+    result = mgr.store_biz_nodes(nodes)
+    assert result is True
+    call_args = mock_client.insert_rows_json.call_args
+    inserted_rows = call_args[0][1]
+    assert inserted_rows[0]["artifact_uri"] == "gs://bucket/artifact.json"
+
+  def test_create_cross_links_fails_on_real_delete_error(self):
+    mock_client = MagicMock()
+    # First call (create table) succeeds, second (delete) fails
+    mock_job_ok = MagicMock()
+    mock_job_ok.result.return_value = None
+    call_count = {"n": 0}
+
+    def side_effect(*args, **kwargs):
+      call_count["n"] += 1
+      if call_count["n"] == 2:
+        raise Exception("Permission denied")
+      return mock_job_ok
+
+    mock_client.query.side_effect = side_effect
+    mgr = self._make_manager(mock_client)
+
+    result = mgr.create_cross_links(["sess-1"])
+    assert result is False
+
+  def test_create_cross_links_ignores_not_found_delete(self):
+    mock_client = MagicMock()
+    mock_job_ok = MagicMock()
+    mock_job_ok.result.return_value = None
+    call_count = {"n": 0}
+
+    def side_effect(*args, **kwargs):
+      call_count["n"] += 1
+      if call_count["n"] == 2:
+        raise Exception("Table not found: cross_links")
+      return mock_job_ok
+
+    mock_client.query.side_effect = side_effect
+    mgr = self._make_manager(mock_client)
+
+    result = mgr.create_cross_links(["sess-1"])
+    assert result is True
+
 
 # ------------------------------------------------------------------ #
 # Client integration test                                              #
@@ -744,3 +803,174 @@ class TestClientContextGraph:
             assert "s2" in span_ids
             assert "s3" in span_ids
             assert len(result.spans) == 3
+
+  def test_get_session_trace_gql_backfills_parent_link(self):
+    """Span first seen as parent_ gets parent_span_id backfilled."""
+    with patch(
+        "bigquery_agent_analytics.client.bigquery.Client"
+    ):
+      from bigquery_agent_analytics.client import Client
+      from bigquery_agent_analytics.trace import Span, Trace
+
+      with patch.object(Client, "_verify_schema"):
+        client = Client(
+            project_id="p",
+            dataset_id="d",
+        )
+        ts1 = datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc)
+        ts2 = datetime(2025, 6, 1, 12, 1, tzinfo=timezone.utc)
+        ts3 = datetime(2025, 6, 1, 12, 2, tzinfo=timezone.utc)
+        # Row 1: s2 is parent of s3
+        # Row 2: s1 is parent of s2
+        # So s2 is seen first as parent_ (no parent link),
+        # then as child_ of s1 — must backfill.
+        gql_rows = [
+            {
+                "parent_span_id": "s2",
+                "parent_event_type": "LLM_REQUEST",
+                "parent_agent": "root",
+                "parent_timestamp": ts2,
+                "session_id": "sess-1",
+                "parent_invocation_id": "inv-1",
+                "parent_content": {},
+                "parent_latency_ms": None,
+                "parent_status": "OK",
+                "parent_error_message": None,
+                "child_span_id": "s3",
+                "child_event_type": "TOOL_COMPLETED",
+                "child_agent": "root",
+                "child_timestamp": ts3,
+                "child_invocation_id": "inv-1",
+                "child_content": {},
+                "child_latency_ms": 100,
+                "child_status": "OK",
+                "child_error_message": None,
+            },
+            {
+                "parent_span_id": "s1",
+                "parent_event_type": "USER_MESSAGE_RECEIVED",
+                "parent_agent": "root",
+                "parent_timestamp": ts1,
+                "session_id": "sess-1",
+                "parent_invocation_id": "inv-1",
+                "parent_content": {},
+                "parent_latency_ms": None,
+                "parent_status": "OK",
+                "parent_error_message": None,
+                "child_span_id": "s2",
+                "child_event_type": "LLM_REQUEST",
+                "child_agent": "root",
+                "child_timestamp": ts2,
+                "child_invocation_id": "inv-1",
+                "child_content": {},
+                "child_latency_ms": 200,
+                "child_status": "OK",
+                "child_error_message": None,
+            },
+        ]
+        flat_trace = Trace(
+            trace_id="t1", session_id="sess-1", spans=[
+                Span(event_type="USER_MESSAGE_RECEIVED",
+                     agent="root", timestamp=ts1, span_id="s1"),
+                Span(event_type="LLM_REQUEST",
+                     agent="root", timestamp=ts2, span_id="s2"),
+                Span(event_type="TOOL_COMPLETED",
+                     agent="root", timestamp=ts3, span_id="s3"),
+            ],
+        )
+        with patch.object(
+            ContextGraphManager, "reconstruct_trace_gql",
+            return_value=gql_rows,
+        ):
+          with patch.object(
+              Client, "get_session_trace",
+              return_value=flat_trace,
+          ):
+            result = client.get_session_trace_gql(
+                session_id="sess-1"
+            )
+            by_id = {s.span_id: s for s in result.spans}
+            # s2 should have s1 as parent (backfilled)
+            assert by_id["s2"].parent_span_id == "s1"
+            # s3 should have s2 as parent
+            assert by_id["s3"].parent_span_id == "s2"
+            # s1 has no parent
+            assert by_id["s1"].parent_span_id is None
+
+  def test_get_session_trace_gql_chronological_order(self):
+    """Spans are returned in chronological order."""
+    with patch(
+        "bigquery_agent_analytics.client.bigquery.Client"
+    ):
+      from bigquery_agent_analytics.client import Client
+      from bigquery_agent_analytics.trace import Span, Trace
+
+      with patch.object(Client, "_verify_schema"):
+        client = Client(
+            project_id="p",
+            dataset_id="d",
+        )
+        ts1 = datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc)
+        ts2 = datetime(2025, 6, 1, 12, 1, tzinfo=timezone.utc)
+        ts3 = datetime(2025, 6, 1, 12, 2, tzinfo=timezone.utc)
+        # GQL rows in reverse order
+        gql_rows = [
+            {
+                "parent_span_id": "s2",
+                "parent_event_type": "LLM_REQUEST",
+                "parent_agent": "root",
+                "parent_timestamp": ts2,
+                "session_id": "sess-1",
+                "parent_invocation_id": "inv-1",
+                "parent_content": {},
+                "parent_latency_ms": None,
+                "parent_status": "OK",
+                "parent_error_message": None,
+                "child_span_id": "s3",
+                "child_event_type": "TOOL_COMPLETED",
+                "child_agent": "root",
+                "child_timestamp": ts3,
+                "child_invocation_id": "inv-1",
+                "child_content": {},
+                "child_latency_ms": 100,
+                "child_status": "OK",
+                "child_error_message": None,
+            },
+            {
+                "parent_span_id": "s1",
+                "parent_event_type": "USER_MESSAGE_RECEIVED",
+                "parent_agent": "root",
+                "parent_timestamp": ts1,
+                "session_id": "sess-1",
+                "parent_invocation_id": "inv-1",
+                "parent_content": {},
+                "parent_latency_ms": None,
+                "parent_status": "OK",
+                "parent_error_message": None,
+                "child_span_id": "s2",
+                "child_event_type": "LLM_REQUEST",
+                "child_agent": "root",
+                "child_timestamp": ts2,
+                "child_invocation_id": "inv-1",
+                "child_content": {},
+                "child_latency_ms": 200,
+                "child_status": "OK",
+                "child_error_message": None,
+            },
+        ]
+        flat_trace = Trace(
+            trace_id="t1", session_id="sess-1", spans=[],
+        )
+        with patch.object(
+            ContextGraphManager, "reconstruct_trace_gql",
+            return_value=gql_rows,
+        ):
+          with patch.object(
+              Client, "get_session_trace",
+              return_value=flat_trace,
+          ):
+            result = client.get_session_trace_gql(
+                session_id="sess-1"
+            )
+            ids = [s.span_id for s in result.spans]
+            assert ids == ["s1", "s2", "s3"]

@@ -1731,12 +1731,16 @@ class Client:
       )
       return flat_trace
 
-    # Build spans from GQL edge pairs
+    # Build spans from GQL edge pairs.
+    # A span may appear as parent_ first (no parent link) then as
+    # child_ later — backfill parent_span_id when that happens.
     seen: dict[str, dict[str, Any]] = {}
     for row in rows:
       for prefix in ("parent_", "child_"):
         sid = row.get(f"{prefix}span_id")
-        if sid and sid not in seen:
+        if not sid:
+          continue
+        if sid not in seen:
           seen[sid] = {
               "span_id": sid,
               "event_type": row.get(f"{prefix}event_type", "UNKNOWN"),
@@ -1753,6 +1757,9 @@ class Client:
                   if prefix == "child_" else None
               ),
           }
+        elif prefix == "child_" and not seen[sid].get("parent_span_id"):
+          # Backfill parent link from this child_ edge
+          seen[sid]["parent_span_id"] = row.get("parent_span_id")
 
     gql_spans = [Span.from_bigquery_row(v) for v in seen.values()]
 
@@ -1761,6 +1768,11 @@ class Client:
     for span in flat_trace.spans:
       if span.span_id and span.span_id not in gql_span_ids:
         gql_spans.append(span)
+
+    # Sort by timestamp for deterministic chronological order
+    gql_spans.sort(
+        key=lambda s: (s.timestamp or datetime.min, s.span_id or "")
+    )
 
     spans = gql_spans
     user_id = flat_trace.user_id
