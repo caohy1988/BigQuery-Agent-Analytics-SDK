@@ -44,18 +44,18 @@ import the library. This creates three gaps:
 ### 1.3 Proposed State
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Shared Core (Python)                        │
-│  Client, evaluators, insights, feedback, trace, context_graph  │
-├───────────────────┬──────────────────────┬──────────────────────┤
-│  Python Library   │ BigQuery Remote Fn   │  CLI (bq-agent-sdk)  │
-│  (existing)       │ (Path A — Scale)     │  (Path B — Agent)    │
-│                   │                      │                      │
-│  import Client    │ SELECT analyze(...)  │ $ bq-agent-sdk       │
-│  Notebooks, apps  │ FROM table           │   get-trace ...      │
-│                   │ Looker, Data Studio  │   evaluate ...       │
-│                   │ Scheduled queries    │   insights ...       │
-└───────────────────┴──────────────────────┴──────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                          Shared Core (Python)                                │
+│     Client, evaluators, insights, feedback, trace, context_graph             │
+├───────────────┬────────────────────┬────────────────────┬────────────────────┤
+│ Python Lib    │ BQ Remote Function │ Continuous Query   │ CLI               │
+│ (existing)    │ (Path A — Batch)   │ (Path A' — Stream) │ (Path B — Agent)  │
+│               │                    │                    │                   │
+│ import Client │ SELECT fn(...)     │ APPENDS() +        │ $ bq-agent-sdk    │
+│ Notebooks     │ Scheduled queries  │ AI.GENERATE        │   evaluate ...    │
+│ Python apps   │ Looker, dashboards │ → BQ / Pub/Sub /   │   insights ...    │
+│               │                    │   Bigtable / Spanner│                   │
+└───────────────┴────────────────────┴────────────────────┴────────────────────┘
 ```
 
 ---
@@ -262,6 +262,19 @@ FROM UNNEST([
 
 ### 3.4 Remote Function Technical Design
 
+> Reference:
+> [BigQuery Remote Functions](https://cloud.google.com/bigquery/docs/remote-functions)
+
+#### Prerequisites
+
+| Requirement | Detail |
+|-------------|--------|
+| **Connection** | A `CLOUD_RESOURCE` connection (`bq mk --connection --connection_type=CLOUD_RESOURCE`) |
+| **IAM — Creator** | `bigquery.routines.create` on dataset + `bigquery.connections.delegate` on connection |
+| **IAM — Invoker** | `bigquery.routines.get` on dataset + `bigquery.connections.use` on connection |
+| **Service account** | The connection's auto-created SA needs **Cloud Run Invoker** role on the Cloud Function / Cloud Run service |
+| **Return types** | `BOOL`, `BYTES`, `NUMERIC`, `STRING`, `DATE`, `DATETIME`, `TIME`, `TIMESTAMP`, `JSON`. **Not supported:** `ARRAY`, `STRUCT`, `INTERVAL`, `GEOGRAPHY` |
+
 #### Deployment Architecture
 
 ```
@@ -275,19 +288,29 @@ FROM UNNEST([
 
 #### Request/Response Contract
 
-**Input** (from BigQuery Remote Function):
+BigQuery sends batched rows as HTTP POST requests. Each element in `calls`
+represents one row's arguments. BigQuery automatically determines batch
+size but respects the `max_batching_rows` limit. Retries happen on HTTP
+408, 429, 500, 503, 504. Results are never cached (assumed non-deterministic).
+
+**Request** (POST from BigQuery):
 ```json
 {
-  "requestId": "...",
-  "caller": "bigquery",
+  "requestId": "124ab1c",
+  "caller": "//bigquery.googleapis.com/projects/myproject/jobs/bqjob_r1234_00001",
+  "sessionUser": "analyst@company.com",
+  "userDefinedContext": {
+    "project_id": "myproject",
+    "dataset_id": "analytics"
+  },
   "calls": [
-    ["sess-001", "latency", "5000"],
-    ["sess-002", "latency", "5000"]
+    ["evaluate", "{\"session_id\":\"sess-001\",\"metric\":\"latency\",\"threshold\":5000}"],
+    ["evaluate", "{\"session_id\":\"sess-002\",\"metric\":\"latency\",\"threshold\":5000}"]
   ]
 }
 ```
 
-**Output** (returned to BigQuery):
+**Response** (HTTP 200):
 ```json
 {
   "replies": [
@@ -295,6 +318,42 @@ FROM UNNEST([
     "{\"passed\": false, \"score\": 0.32, \"details\": \"avg=7800ms\"}"
   ]
 }
+```
+
+**Error response** (non-retryable 4xx):
+```json
+{
+  "errorMessage": "Unknown operation: foo (max 1KB)"
+}
+```
+
+#### CREATE FUNCTION DDL
+
+```sql
+-- 1. Create CLOUD_RESOURCE connection (one-time)
+--    Console: Explorer → +Add → External Connection → "Vertex AI remote models,
+--             remote functions, BigLake and Spanner"
+--    CLI:
+--    bq mk --connection --location=US --project_id=myproject \
+--           --connection_type=CLOUD_RESOURCE analytics-conn
+
+-- 2. Grant Cloud Run Invoker to the connection's service account
+--    (find the SA in connection details → IAM → add role)
+
+-- 3. Register the remote function
+CREATE FUNCTION `myproject.analytics.agent_analytics`(
+  operation STRING,
+  params JSON
+) RETURNS JSON
+REMOTE WITH CONNECTION `myproject.us.analytics-conn`
+OPTIONS (
+  endpoint = 'https://us-central1-myproject.cloudfunctions.net/bq-agent-analytics',
+  user_defined_context = [
+    ("project_id", "myproject"),
+    ("dataset_id", "analytics")
+  ],
+  max_batching_rows = 50
+);
 ```
 
 #### Entry Point (`deploy/remote_function/main.py`)
@@ -307,25 +366,44 @@ appropriate SDK method and returns JSON results.
 import functions_framework
 import json
 import os
+from flask import jsonify
 from bigquery_agent_analytics import Client, CodeEvaluator, LLMAsJudge, TraceFilter
 
-# Initialized once per instance (cold start)
-client = Client(
-    project_id=os.environ["PROJECT_ID"],
-    dataset_id=os.environ["DATASET_ID"],
-)
+# Initialized once per cold start. Config comes from userDefinedContext
+# (forwarded by BigQuery) or environment variables as fallback.
+_client = None
+
+def _get_client(context: dict) -> Client:
+    global _client
+    if _client is None:
+        _client = Client(
+            project_id=context.get("project_id", os.environ["PROJECT_ID"]),
+            dataset_id=context.get("dataset_id", os.environ["DATASET_ID"]),
+        )
+    return _client
 
 @functions_framework.http
 def handle_request(request):
-    body = request.get_json()
-    replies = []
-    for call in body["calls"]:
-        operation, params_json = call[0], json.loads(call[1])
-        result = dispatch(operation, params_json)
-        replies.append(json.dumps(result))
-    return json.dumps({"replies": replies})
+    """Entry point called by BigQuery Remote Function framework.
 
-def dispatch(operation, params):
+    BigQuery batches rows into `calls`. Each call is [operation, params_json].
+    The `replies` array must have the same length as `calls`.
+    """
+    try:
+        body = request.get_json()
+        context = body.get("userDefinedContext", {})
+        client = _get_client(context)
+        replies = []
+        for call in body["calls"]:
+            operation, params_raw = call[0], call[1]
+            params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+            result = _dispatch(client, operation, params)
+            replies.append(json.dumps(result))
+        return jsonify({"replies": replies})
+    except Exception as e:
+        return jsonify({"errorMessage": str(e)[:1024]}), 400
+
+def _dispatch(client, operation, params):
     if operation == "analyze":
         trace = client.get_session_trace(params["session_id"])
         return {
@@ -355,8 +433,303 @@ def dispatch(operation, params):
             ))
         return report.model_dump()
     else:
-        return {"error": f"Unknown operation: {operation}"}
+        raise ValueError(f"Unknown operation: {operation}")
 ```
+
+**Deploy:**
+```bash
+gcloud functions deploy bq-agent-analytics \
+    --gen2 \
+    --runtime python312 \
+    --region us-central1 \
+    --entry-point handle_request \
+    --source ./deploy/remote_function/ \
+    --trigger-http \
+    --no-allow-unauthenticated \
+    --set-env-vars PROJECT_ID=myproject,DATASET_ID=analytics
+```
+
+---
+
+## 3A. Path A-bis: Continuous Queries for Real-Time Analytics
+
+### 3A.1 Overview
+
+> Reference:
+> [BigQuery Continuous Queries](https://cloud.google.com/bigquery/docs/continuous-queries-introduction),
+> [Create Continuous Queries](https://cloud.google.com/bigquery/docs/continuous-queries)
+
+BigQuery **continuous queries** run SQL continuously against new data as it
+arrives, using the `APPENDS()` table function. They process each row as it
+is ingested and write results to BigQuery tables, Pub/Sub, Bigtable, or
+Spanner — enabling real-time, event-driven analytics over agent traces.
+
+#### Key Capabilities and Constraints
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | Automatically fires on new rows via `APPENDS(TABLE ..., start_timestamp)` |
+| **Destinations** | `INSERT INTO` (BigQuery table), `EXPORT DATA` (Pub/Sub, Bigtable, Spanner) |
+| **AI functions** | `AI.GENERATE`, `AI.GENERATE_TEXT`, `ML.UNDERSTAND_TEXT`, `ML.TRANSLATE` — fully supported |
+| **Remote functions** | **Not supported** — continuous queries cannot call user-defined remote functions |
+| **SQL restrictions** | No `JOIN`, `GROUP BY`, `DISTINCT`, aggregates, window functions, `ORDER BY`, `LIMIT` |
+| **Execution** | `bq query --continuous=true` or API `"continuous": true` — not a DDL statement |
+| **Reservation** | Requires Enterprise / Enterprise Plus edition with `CONTINUOUS` job type assignment (max 500 slots) |
+| **Max runtime** | 2 days (user account), 150 days (service account) |
+| **Processing model** | Stateless per-row; no cross-row state. Idle queries consume ~1 slot |
+
+#### Why This Matters for the SDK
+
+The ADK plugin writes events to the `agent_events` table via the BigQuery
+Storage Write API. A continuous query can monitor this table in real-time
+and apply `AI.GENERATE` — the same LLM evaluation engine the SDK uses —
+to score, classify, or flag every session as events arrive. **No Cloud
+Function deployment needed; pure SQL.**
+
+This creates a third analytics path:
+
+```
+Path A:  Remote Function   → batch SQL analytics via Cloud Function
+Path A': Continuous Query   → real-time streaming analytics via AI.GENERATE
+Path B:  CLI               → agent self-diagnostics and CI/CD
+```
+
+### 3A.2 Critical User Journeys (CUJ)
+
+#### CUJ-A4: Priya Builds Real-Time Error Alerting with Continuous Query + AI.GENERATE
+
+**Goal:** Every time an agent session ends with an error, automatically
+classify the failure root cause using Gemini and push an alert to Pub/Sub
+(which routes to Slack/PagerDuty). No Cloud Function, no cron — pure
+streaming SQL.
+
+**Architecture:**
+
+```
+┌──────────────┐    ┌─────────────────────────┐    ┌──────────────┐
+│  ADK Plugin  │───▶│  agent_events table      │───▶│  Continuous  │
+│  (writes     │    │  (BigQuery)              │    │  Query       │
+│   events)    │    │                          │    │  + AI.GENERATE│
+└──────────────┘    └─────────────────────────┘    └──────┬───────┘
+                                                          │
+                                          ┌───────────────┼───────────────┐
+                                          ▼               ▼               ▼
+                                   ┌────────────┐ ┌────────────┐ ┌──────────────┐
+                                   │ error_      │ │ Pub/Sub    │ │ Bigtable     │
+                                   │ analysis    │ │ (→ Slack)  │ │ (low-latency │
+                                   │ table       │ │            │ │  dashboard)  │
+                                   └────────────┘ └────────────┘ └──────────────┘
+```
+
+**Step 1: Create the AI model endpoint for evaluation**
+
+```sql
+-- Create a remote model pointing to Gemini (one-time setup)
+CREATE OR REPLACE MODEL `myproject.analytics.gemini_flash`
+REMOTE WITH CONNECTION `myproject.us.analytics-conn`
+OPTIONS (
+  endpoint = 'gemini-2.5-flash'
+);
+```
+
+**Step 2: Create destination table for analysis results**
+
+```sql
+CREATE TABLE IF NOT EXISTS `myproject.analytics.realtime_error_analysis` (
+  session_id STRING,
+  agent STRING,
+  event_type STRING,
+  error_message STRING,
+  timestamp TIMESTAMP,
+  root_cause STRING,
+  severity STRING,
+  suggested_fix STRING,
+  analyzed_at TIMESTAMP
+);
+```
+
+**Step 3: Launch continuous query (real-time error analysis)**
+
+```bash
+bq query --project_id=myproject --use_legacy_sql=false \
+  --continuous=true \
+  --connection_property=service_account=analytics-cq@myproject.iam.gserviceaccount.com \
+  '
+INSERT INTO `myproject.analytics.realtime_error_analysis`
+SELECT
+  base.session_id,
+  base.agent,
+  base.event_type,
+  base.error_message,
+  base.timestamp,
+  JSON_VALUE(analysis.ml_generate_text_llm_result, "$.root_cause") AS root_cause,
+  JSON_VALUE(analysis.ml_generate_text_llm_result, "$.severity") AS severity,
+  JSON_VALUE(analysis.ml_generate_text_llm_result, "$.suggested_fix") AS suggested_fix,
+  CURRENT_TIMESTAMP() AS analyzed_at
+FROM
+  AI.GENERATE_TEXT(
+    MODEL `myproject.analytics.gemini_flash`,
+    (
+      SELECT
+        session_id,
+        agent,
+        event_type,
+        error_message,
+        timestamp,
+        CONCAT(
+          "Analyze this agent error and return JSON with keys: ",
+          "root_cause (one of: tool_timeout, invalid_input, api_failure, ",
+          "model_error, permission_denied, rate_limit, unknown), ",
+          "severity (critical, high, medium, low), ",
+          "suggested_fix (one sentence). ",
+          "Agent: ", COALESCE(agent, "unknown"),
+          " | Event: ", event_type,
+          " | Error: ", COALESCE(error_message, "no message")
+        ) AS prompt
+      FROM
+        APPENDS(
+          TABLE `myproject.analytics.agent_events`,
+          CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE
+        )
+      WHERE
+        ENDS_WITH(event_type, "_ERROR")
+        OR error_message IS NOT NULL
+        OR status = "ERROR"
+    ),
+    STRUCT(100 AS max_output_tokens, 0.1 AS temperature)
+  ) AS analysis
+'
+```
+
+**What happens at runtime:**
+
+```
+14:00:01  Plugin writes TOOL_ERROR for sess-042
+14:00:02  Continuous query detects new error row via APPENDS()
+14:00:03  AI.GENERATE_TEXT classifies: root_cause=tool_timeout, severity=high
+14:00:03  Result inserted into realtime_error_analysis table
+          → Looker dashboard updates in real-time
+          → (Optional) Second continuous query exports to Pub/Sub → Slack
+```
+
+**Step 4 (Optional): Chain a second continuous query to Pub/Sub for alerts**
+
+```bash
+bq query --project_id=myproject --use_legacy_sql=false \
+  --continuous=true \
+  --connection_property=service_account=analytics-cq@myproject.iam.gserviceaccount.com \
+  '
+EXPORT DATA
+  OPTIONS (
+    format = "CLOUD_PUBSUB",
+    uri = "https://pubsub.googleapis.com/projects/myproject/topics/agent-error-alerts"
+  )
+AS (
+  SELECT
+    TO_JSON_STRING(
+      STRUCT(
+        session_id,
+        agent,
+        root_cause,
+        severity,
+        error_message,
+        suggested_fix
+      )
+    ) AS message,
+    TO_JSON(
+      STRUCT(
+        severity AS severity,
+        agent AS agent
+      )
+    ) AS _ATTRIBUTES
+  FROM
+    APPENDS(
+      TABLE `myproject.analytics.realtime_error_analysis`,
+      CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE
+    )
+  WHERE severity IN ("critical", "high")
+)
+'
+```
+
+**End-to-end result:** Every high-severity agent error is automatically
+analyzed by Gemini within seconds of occurrence, stored in a queryable
+table, and routed to Slack/PagerDuty via Pub/Sub — all with zero
+application code.
+
+---
+
+#### CUJ-A5: Priya Streams Session Quality Scores to Bigtable for Low-Latency Dashboards
+
+**Goal:** Score every completed agent session in real-time and write results
+to Bigtable for sub-millisecond dashboard reads.
+
+```bash
+bq query --project_id=myproject --use_legacy_sql=false \
+  --continuous=true \
+  --connection_property=service_account=analytics-cq@myproject.iam.gserviceaccount.com \
+  '
+EXPORT DATA
+  OPTIONS (
+    format = "CLOUD_BIGTABLE",
+    overwrite = TRUE,
+    uri = "https://bigtable.googleapis.com/projects/myproject/instances/agent-metrics/tables/session-scores"
+  )
+AS (
+  SELECT
+    CONCAT(base.session_id, "#", CAST(base.timestamp AS STRING)) AS rowkey,
+    STRUCT(
+      base.session_id,
+      base.agent,
+      base.timestamp,
+      JSON_VALUE(analysis.ml_generate_text_llm_result, "$.quality_score") AS quality_score,
+      JSON_VALUE(analysis.ml_generate_text_llm_result, "$.outcome") AS outcome,
+      JSON_VALUE(analysis.ml_generate_text_llm_result, "$.summary") AS summary
+    ) AS metrics
+  FROM
+    AI.GENERATE_TEXT(
+      MODEL `myproject.analytics.gemini_flash`,
+      (
+        SELECT
+          session_id,
+          agent,
+          timestamp,
+          CONCAT(
+            "Score this completed agent session. Return JSON with: ",
+            "quality_score (0.0-1.0), outcome (success/partial/failure), ",
+            "summary (one sentence). ",
+            "Agent: ", COALESCE(agent, "unknown"),
+            " | Response: ", COALESCE(
+              JSON_VALUE(content, "$.response"),
+              JSON_VALUE(content, "$.text_summary"),
+              "no response"
+            )
+          ) AS prompt
+        FROM
+          APPENDS(
+            TABLE `myproject.analytics.agent_events`,
+            CURRENT_TIMESTAMP() - INTERVAL 10 MINUTE
+          )
+        WHERE event_type = "AGENT_COMPLETED"
+      ),
+      STRUCT(80 AS max_output_tokens, 0.1 AS temperature)
+    ) AS analysis
+)
+'
+```
+
+### 3A.3 When to Use Which Path
+
+| Scenario | Path | Why |
+|----------|------|-----|
+| Nightly batch evaluation of all sessions | **Remote Function** (Path A) | Needs JOINs, GROUP BY, aggregation — not supported in continuous queries |
+| Real-time error classification as events arrive | **Continuous Query** (Path A') | Stateless per-row processing; AI.GENERATE on each error; no deployment needed |
+| Dashboard with sub-second latency | **Continuous Query → Bigtable** | EXPORT DATA to Bigtable for low-latency reads |
+| Alert on critical errors via Slack/PagerDuty | **Continuous Query → Pub/Sub** | EXPORT DATA to Pub/Sub with severity-based attributes |
+| Agent self-diagnostic before responding | **CLI** (Path B) | Agent calls `bq-agent-sdk evaluate` as a tool |
+| CI/CD gate blocking deployment | **CLI** (Path B) | `--exit-code` in GitHub Actions |
+| Ad-hoc drift analysis comparing golden set | **Remote Function** (Path A) | Needs cross-table comparison (JOIN with golden set) |
+| Semantic session clustering | **Remote Function** (Path A) | Needs aggregation and embedding distance (GROUP BY) |
 
 ---
 
@@ -1010,18 +1383,32 @@ Options:
       - `requirements.txt`
       - `deploy.sh` (gcloud deployment script)
       - `register.sql` (CREATE FUNCTION DDL templates)
-- [ ] Implement dispatch for: `analyze_session`, `evaluate_session`,
-      `judge_session`, `session_insights`, `check_drift`
+- [ ] Implement dispatch for: `analyze`, `evaluate`, `judge`, `insights`,
+      `drift`
 - [ ] Add Terraform/gcloud deployment automation
 - [ ] Write integration tests with BigQuery Remote Function simulator
-- [ ] Document deployment guide with prerequisites
+- [ ] Document deployment guide with IAM prerequisites
 
-### Phase 4: Documentation & Polish (1 week)
+### Phase 4: Continuous Query Templates (1 week)
 
-- [ ] Update SDK.md with CLI and Remote Function sections
+- [ ] Create `deploy/continuous_queries/` directory with:
+      - `realtime_error_analysis.sql` — AI.GENERATE error classification
+      - `session_scoring.sql` — per-session quality scoring
+      - `pubsub_alerting.sql` — critical error → Pub/Sub export
+      - `bigtable_dashboard.sql` — session metrics → Bigtable
+      - `setup_reservation.md` — Enterprise reservation guide
+- [ ] Document AI.GENERATE prompt templates aligned with SDK evaluation
+      criteria (correctness, hallucination, sentiment)
+- [ ] Add backfill guide (FOR SYSTEM_TIME AS OF → APPENDS handoff)
+- [ ] Document continuous query monitoring via INFORMATION_SCHEMA.JOBS
+
+### Phase 5: Documentation & Polish (1 week)
+
+- [ ] Update SDK.md with CLI, Remote Function, and Continuous Query sections
 - [ ] Add `examples/cli_agent_tool.py` — example ADK agent using CLI as tool
 - [ ] Add `examples/ci_eval_pipeline.sh` — example CI/CD script
 - [ ] Add `examples/remote_function_dashboard.sql` — example Looker queries
+- [ ] Add `examples/continuous_query_alerting.sql` — real-time error alerting
 - [ ] Update README.md with new interfaces
 
 ---
