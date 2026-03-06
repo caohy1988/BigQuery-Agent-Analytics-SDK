@@ -58,6 +58,14 @@ import the library. This creates three gaps:
 └───────────────┴────────────────────┴────────────────────┴────────────────────┘
 ```
 
+### 1.4 MVP Scope
+
+**v1.0 = CLI with `evaluate`, `get-trace`, `doctor`, and `--exit-code`.**
+
+This is the smallest cut that unblocks all three personas. Remote Function
+(Path A) and Continuous Query (Path A') ship in v1.1/v1.2. See §8.1 for
+the full MVP definition, feature-to-version mapping, and rationale.
+
 ---
 
 ## 2. User Personas
@@ -327,6 +335,74 @@ size but respects the `max_batching_rows` limit. Retries happen on HTTP
 }
 ```
 
+#### API Versioning & Stability Contract
+
+The remote function response includes a `_version` field for forward
+compatibility. Clients should ignore unknown fields.
+
+```json
+{
+  "replies": [
+    "{\"_version\":\"1.0\",\"passed\":true,\"score\":0.85,\"details\":\"avg=2340ms\"}"
+  ]
+}
+```
+
+**Version guarantees:**
+- **v1.x:** Additive changes only (new fields, new operations). Existing
+  fields and operations are never removed or renamed.
+- **v2.0:** Breaking changes require a new Cloud Function endpoint and
+  new `CREATE FUNCTION` registration.
+
+#### Error Codes
+
+Every per-row error in `replies` uses a structured error object instead of
+a result:
+
+```json
+{
+  "replies": [
+    "{\"passed\":true,\"score\":0.85}",
+    "{\"_error\":{\"code\":\"SESSION_NOT_FOUND\",\"message\":\"No events for session sess-999\"}}"
+  ]
+}
+```
+
+| Error Code | HTTP | Retryable | Description |
+|-----------|------|-----------|-------------|
+| `INVALID_OPERATION` | 400 | No | Unknown operation string |
+| `INVALID_PARAMS` | 400 | No | Missing or malformed params JSON |
+| `SESSION_NOT_FOUND` | 200* | No | No events found for session_id |
+| `EVALUATION_FAILED` | 200* | No | Evaluator raised an exception |
+| `UPSTREAM_TIMEOUT` | 200* | Yes | BigQuery query timed out |
+| `INTERNAL_ERROR` | 200* | Yes | Unexpected SDK error |
+
+*\*Per-row errors return HTTP 200 with error in `replies[i]` so that
+other rows in the batch succeed. Batch-level errors (all rows fail)
+return HTTP 400 with top-level `errorMessage`.*
+
+#### Partial Failure Semantics
+
+BigQuery batches multiple rows into a single HTTP request. The function
+processes each row independently:
+
+- If row 2 of 5 fails, rows 1, 3, 4, 5 return valid results. Row 2
+  returns a `_error` object in its `replies` slot.
+- BigQuery surfaces the `_error` JSON as the column value — the caller
+  can filter with `JSON_VALUE(result, '$._error.code') IS NOT NULL`.
+- Only if **all** rows fail does the function return HTTP 400.
+
+#### Idempotency Guidance
+
+BigQuery may retry requests on transient errors (HTTP 408/429/5xx).
+The function should be safe to call multiple times with the same input:
+
+- `analyze` and `evaluate` are naturally idempotent (read-only queries).
+- `judge` calls AI.GENERATE which may return slightly different scores —
+  this is acceptable (non-deterministic by nature).
+- The `requestId` field can be used for deduplication if the function
+  performs any write operations in the future.
+
 #### CREATE FUNCTION DDL
 
 ```sql
@@ -470,8 +546,8 @@ Spanner — enabling real-time, event-driven analytics over agent traces.
 |--------|--------|
 | **Trigger** | Automatically fires on new rows via `APPENDS(TABLE ..., start_timestamp)` |
 | **Destinations** | `INSERT INTO` (BigQuery table), `EXPORT DATA` (Pub/Sub, Bigtable, Spanner) |
-| **AI functions** | `AI.GENERATE`, `AI.GENERATE_TEXT`, `ML.UNDERSTAND_TEXT`, `ML.TRANSLATE` — fully supported |
-| **Remote functions** | **Not supported** — continuous queries cannot call user-defined remote functions |
+| **AI functions** | `AI.GENERATE_TEXT` and `ML.GENERATE_TEXT` — supported for remote models (Gemini, etc.). `AI.GENERATE_TABLE` — **not supported** in continuous queries. `ML.UNDERSTAND_TEXT`, `ML.TRANSLATE` — supported. See [supported AI functions in CQ](https://cloud.google.com/bigquery/docs/continuous-queries-introduction#supported_statements). |
+| **Remote functions** | **Not supported** — continuous queries cannot call user-defined remote functions (CREATE FUNCTION ... REMOTE) |
 | **SQL restrictions** | No `JOIN`, `GROUP BY`, `DISTINCT`, aggregates, window functions, `ORDER BY`, `LIMIT` |
 | **Execution** | `bq query --continuous=true` or API `"continuous": true` — not a DDL statement |
 | **Reservation** | Requires Enterprise / Enterprise Plus edition with `CONTINUOUS` job type assignment (max 500 slots) |
@@ -1439,9 +1515,252 @@ Options:
 
 ---
 
-## 5. Implementation Roadmap
+## 5. Security & IAM
 
-### Phase 1: Core Refactoring (1 week)
+### 5.1 Least-Privilege IAM Roles
+
+Each path requires a distinct service account with minimum permissions.
+**Never use the default Compute Engine or App Engine service account.**
+
+#### Remote Function Runtime SA (`bq-analytics-fn@PROJECT.iam`)
+
+This SA runs the Cloud Function / Cloud Run service.
+
+```bash
+# Create SA
+gcloud iam service-accounts create bq-analytics-fn \
+  --display-name="BQ Agent Analytics Remote Function"
+
+# Grant minimum roles
+# 1. Read agent_events table
+gcloud projects add-iam-policy-binding PROJECT \
+  --member="serviceAccount:bq-analytics-fn@PROJECT.iam.gserviceaccount.com" \
+  --role="roles/bigquery.dataViewer" \
+  --condition="expression=resource.name.startsWith('projects/PROJECT/datasets/analytics'),title=analytics-only"
+
+# 2. Run BigQuery jobs (for SDK queries)
+gcloud projects add-iam-policy-binding PROJECT \
+  --member="serviceAccount:bq-analytics-fn@PROJECT.iam.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+```
+
+| Role | Resource | Why |
+|------|----------|-----|
+| `roles/bigquery.dataViewer` | `analytics` dataset | Read `agent_events` and golden tables |
+| `roles/bigquery.jobUser` | Project | Execute BQ queries from within Cloud Function |
+
+#### BigQuery Connection SA (auto-created)
+
+When you create a `CLOUD_RESOURCE` connection, BigQuery auto-creates a SA.
+Grant it the invoker role on the Cloud Function.
+
+```bash
+# Find the connection's SA
+CONNECTION_SA=$(bq show --connection --format=json PROJECT.us.analytics-conn \
+  | jq -r '.cloudResource.serviceAccountId')
+
+# Grant Cloud Run Invoker so BigQuery can call the function
+gcloud functions add-invoker-policy-binding bq-agent-analytics \
+  --region=us-central1 \
+  --member="serviceAccount:${CONNECTION_SA}"
+```
+
+| Role | Resource | Why |
+|------|----------|-----|
+| `roles/run.invoker` | Cloud Function / Cloud Run | Allow BigQuery to invoke the remote function |
+
+#### Continuous Query SA (`analytics-cq@PROJECT.iam`)
+
+```bash
+gcloud iam service-accounts create analytics-cq \
+  --display-name="BQ Continuous Query SA"
+
+# Read source, write destination, use AI models
+gcloud projects add-iam-policy-binding PROJECT \
+  --member="serviceAccount:analytics-cq@PROJECT.iam.gserviceaccount.com" \
+  --role="roles/bigquery.dataEditor" \
+  --condition="expression=resource.name.startsWith('projects/PROJECT/datasets/analytics'),title=analytics-dataset"
+
+gcloud projects add-iam-policy-binding PROJECT \
+  --member="serviceAccount:analytics-cq@PROJECT.iam.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+
+gcloud projects add-iam-policy-binding PROJECT \
+  --member="serviceAccount:analytics-cq@PROJECT.iam.gserviceaccount.com" \
+  --role="roles/bigquery.connectionUser"
+```
+
+| Role | Resource | Why |
+|------|----------|-----|
+| `roles/bigquery.dataEditor` | `analytics` dataset | Read `agent_events`, write analysis tables |
+| `roles/bigquery.jobUser` | Project | Run continuous query jobs |
+| `roles/bigquery.connectionUser` | Connection | Invoke AI.GENERATE via remote model connection |
+
+### 5.2 CLI Authentication
+
+The CLI uses Application Default Credentials (ADC). No service account
+key files.
+
+```bash
+# Interactive login (developer workstation)
+gcloud auth application-default login
+
+# Service account (CI/CD)
+gcloud auth activate-service-account --key-file=sa-key.json
+# or: use Workload Identity Federation (recommended for GitHub Actions)
+```
+
+Required user/SA permissions for CLI:
+- `roles/bigquery.dataViewer` on the analytics dataset
+- `roles/bigquery.jobUser` on the project
+
+---
+
+## 6. Cost Model
+
+### 6.1 Per-1K Sessions Cost Estimate
+
+Costs assume US multi-region, on-demand pricing (March 2026).
+
+| Component | Per 1K Sessions | Assumptions |
+|-----------|----------------|-------------|
+| **BigQuery scan** (CLI / Remote Fn) | ~$0.03 | ~6 MB scanned per session × $6.25/TB |
+| **Cloud Function invocation** (Remote Fn) | ~$0.01 | 1K invocations × $0.40/million + 256MB × 500ms |
+| **AI.GENERATE_TEXT** (Continuous Query) | ~$1.25 | 1K calls × ~500 input tokens × $0.075/1M + ~100 output tokens × $0.30/1M (Gemini 2.5 Flash) |
+| **BigQuery continuous query slots** | ~$0.50/hr idle | 1 slot minimum × Enterprise edition pricing; billed per reservation |
+| **Pub/Sub export** (alerting) | ~$0.004 | 1K messages × $40/million |
+| **Bigtable export** | ~$0.01 | 1K writes × $0.01/100K rows (depends on instance) |
+
+### 6.2 Monthly Cost Scenarios
+
+| Scenario | Volume | Estimated Monthly Cost |
+|----------|--------|----------------------|
+| **Small** (dev/test) | 10K sessions, CLI only | < $1 (BQ scan only) |
+| **Medium** (production) | 100K sessions, CLI + Remote Fn + nightly eval | ~$15 (BQ scan + Cloud Function) |
+| **Large** (streaming) | 500K sessions, all paths + Continuous Query | ~$700 (dominated by CQ reservation + AI.GENERATE) |
+
+### 6.3 Cost Optimization
+
+- **Partitioning:** `agent_events` table should be partitioned by `timestamp`
+  (ingestion-time or column). All queries use `--last` / `WHERE timestamp >=`
+  which prunes partitions, reducing scan cost by 90%+.
+- **Materialized views:** Cache `daily_quality` table to avoid re-scanning
+  raw events.
+- **AI.GENERATE batching:** Continuous queries process rows as they arrive;
+  no additional batching optimization needed.
+- **Slot reservations:** For continuous queries, a FLEX reservation (per-minute
+  billing) is cheaper than on-demand for sustained workloads.
+
+---
+
+## 7. Per-Path SLOs & Operational Runbook
+
+### 7.1 Service-Level Objectives
+
+| Path | Metric | Target | Measurement |
+|------|--------|--------|-------------|
+| **CLI** | Command latency (p95) | < 10s for `evaluate` (≤ 100 sessions) | CLI timing output (`--verbose`) |
+| **CLI** | Availability | 99.9% (bounded by BigQuery SLA) | BQ job success rate |
+| **CLI** | Max error rate | < 1% of CLI invocations fail due to SDK bugs (vs infra) | Error log classification |
+| **Remote Function** | Response latency (p95) | < 5s for `analyze`, < 15s for `judge` | Cloud Monitoring function latency |
+| **Remote Function** | Availability | 99.5% (Cloud Function + BQ connection) | Cloud Monitoring uptime check |
+| **Remote Function** | Max error rate | < 2% of calls return non-retryable errors | `errorMessage` rate in BQ audit logs |
+| **Remote Function** | Cold start | < 3s (Cloud Function gen2) | Cloud Monitoring cold start metric |
+| **Continuous Query** | Processing latency | < 30s from event ingestion to analysis row written | `analyzed_at - timestamp` delta |
+| **Continuous Query** | Availability | 99% (bounded by Enterprise reservation) | `INFORMATION_SCHEMA.JOBS` status |
+
+### 7.2 Retry Behavior
+
+| Path | Retry Strategy |
+|------|----------------|
+| **CLI** | No automatic retry. User re-runs command. `--exit-code` returns 2 for infra errors (vs 1 for eval failure). |
+| **Remote Function** | BigQuery automatically retries on HTTP 408, 429, 500, 503, 504. The Cloud Function must be **idempotent** for a given `(requestId, call_index)` pair. Non-retryable errors return HTTP 400. |
+| **Continuous Query** | BigQuery restarts failed continuous queries automatically. If a row fails AI.GENERATE, the row is skipped (no dead-letter). Monitor via `INFORMATION_SCHEMA.JOBS`. |
+
+### 7.3 Operational Runbook: "What Happens When It Fails"
+
+#### Remote Function Failures
+
+| Failure | Symptom | Diagnosis | Resolution |
+|---------|---------|-----------|------------|
+| **Cold start timeout** | First query after idle returns timeout | Cloud Monitoring → Function latency spike | Set `--min-instances=1` in deployment; increase timeout to 120s |
+| **Batch too large** | HTTP 413 or OOM | Cloud Monitoring → memory usage | Reduce `max_batching_rows` in CREATE FUNCTION DDL (default 50 → 10) |
+| **SDK query fails** | `errorMessage` in response | Cloud Function logs → BQ error | Check SA permissions (§5.1); verify `agent_events` table exists |
+| **Quota exhaustion** | HTTP 429 from Cloud Function | Cloud quotas dashboard | Request quota increase; add `max_batching_rows` limit |
+| **Connection SA expired** | "Permission denied" in BQ | Connection details → SA status | Re-grant `roles/run.invoker` to connection SA |
+
+#### Continuous Query Failures
+
+| Failure | Symptom | Diagnosis | Resolution |
+|---------|---------|-----------|------------|
+| **AI.GENERATE quota** | Query pauses / slows | `INFORMATION_SCHEMA.JOBS` → error message | Increase Vertex AI quota; reduce `max_output_tokens` |
+| **Reservation exhausted** | Query queued, not processing | Reservation monitor → slot utilization | Add FLEX slots or reduce concurrent CQ count |
+| **Query exceeds 2-day limit** | Query stops | `INFORMATION_SCHEMA.JOBS` → end_time | Use service account (150-day limit); set up auto-restart cron |
+| **Destination table schema mismatch** | Insert fails | CQ error log → schema error | ALTER TABLE to add new columns; restart CQ |
+| **Pub/Sub topic deleted** | EXPORT DATA fails | CQ error log | Recreate topic; restart CQ |
+
+#### CLI Failures
+
+| Failure | Symptom | Diagnosis | Resolution |
+|---------|---------|-----------|------------|
+| **ADC not configured** | "Could not automatically determine credentials" | `gcloud auth list` | Run `gcloud auth application-default login` |
+| **Dataset not found** | "Not found: Dataset" | Verify `--dataset-id` | Check project/dataset spelling; verify IAM access |
+| **Timeout on large evaluation** | Command hangs > 60s | BQ job duration in console | Add `--limit=50` to reduce session count; use `--last=1h` |
+
+### 7.4 Alerting Recommendations
+
+```bash
+# Cloud Monitoring alert policy for Remote Function errors
+gcloud monitoring policies create \
+  --display-name="BQ Analytics Remote Fn Error Rate" \
+  --condition-filter='resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_count" AND metric.labels.status!="ok"' \
+  --condition-threshold-value=0.02 \
+  --condition-threshold-comparison=COMPARISON_GT \
+  --notification-channels=CHANNEL_ID
+
+# BigQuery INFORMATION_SCHEMA query for continuous query health
+SELECT
+  job_id,
+  state,
+  error_result.reason AS error_reason,
+  creation_time,
+  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), creation_time, HOUR) AS running_hours
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE job_type = 'QUERY'
+  AND configuration.query.continuous = TRUE
+  AND creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+ORDER BY creation_time DESC;
+```
+
+---
+
+## 8. Implementation Roadmap
+
+### 8.1 MVP Definition (v1.0)
+
+**v1.0 ships CLI + `evaluate` + `get-trace` + `--exit-code`.** This is the
+minimum surface that unblocks all three personas:
+
+| Feature | Persona Unblocked | Why MVP |
+|---------|-------------------|---------|
+| `bq-agent-sdk evaluate` | Marcus (CI/CD), AgentX (self-diagnostic) | Core value: "is my agent healthy?" |
+| `bq-agent-sdk get-trace` | AgentX (context retrieval) | Enables self-correction loop (CUJ-B5) |
+| `--exit-code` | Marcus (CI/CD gate) | Blocks deploy on eval failure |
+| `--format=json` | AgentX (machine consumption) | Structured output for agent tool use |
+| `bq-agent-sdk doctor` | Marcus (pre-deploy check) | Validates setup before first eval |
+
+**v1.1 (post-MVP):**
+
+| Feature | Target |
+|---------|--------|
+| Remote Function (`agent_analytics()`) | v1.1 — requires Cloud Function deployment infra |
+| `bq-agent-sdk insights`, `drift`, `distribution` | v1.1 — higher-level analytics |
+| `bq-agent-sdk views`, `hitl-metrics`, `list-traces` | v1.1 — convenience commands |
+| Continuous Query templates | v1.2 — requires Enterprise reservation |
+
+### 8.2 Phases
+
+#### Phase 1: Core Refactoring (1 week) — *v1.0*
 
 - [ ] Extract filter-building helpers (`--last`, `--agent-id`, etc.) into
       shared utility that constructs `TraceFilter` from CLI args or remote
@@ -1450,18 +1769,34 @@ Options:
       or Pydantic models with `.model_dump()`)
 - [ ] Add `--format` output formatting layer (JSON, text table, tree)
 
-### Phase 2: CLI (`bq-agent-sdk`) (2 weeks)
+**Exit criteria:**
+- `Client.get_session_trace()` and `Client.evaluate()` return JSON-serializable
+  output (unit test: `json.dumps(result)` succeeds for all evaluators)
+- `TraceFilter.from_cli_args()` parses `--last=1h`, `--agent-id=X`,
+  `--session-id=Y` (unit test coverage ≥ 90%)
+- Format layer renders JSON / text / table for a sample trace (snapshot test)
 
-- [ ] Add `click` or `typer` dependency (optional `[cli]` extra)
+#### Phase 2: CLI MVP (`bq-agent-sdk`) (2 weeks) — *v1.0*
+
+- [ ] Add `typer` dependency (optional `[cli]` extra in `pyproject.toml`)
 - [ ] Implement CLI entry point in `pyproject.toml` `[project.scripts]`
-- [ ] Implement commands: `doctor`, `get-trace`, `list-traces`, `evaluate`,
-      `insights`, `drift`, `distribution`, `hitl-metrics`, `views`
+- [ ] Implement v1.0 commands: `doctor`, `get-trace`, `evaluate`
 - [ ] Add `--exit-code` support for CI/CD integration
 - [ ] Add `--last` time window parser (`1h`, `24h`, `7d`, `30d`)
-- [ ] Write CLI integration tests (mock BQ client)
-- [ ] Document LLM tool-calling schema for agent integration
+- [ ] Write CLI integration tests (mock BQ client, ≥ 85% line coverage)
+- [ ] Write quickstart guide with copy-paste examples
 
-### Phase 3: Remote Function (2 weeks)
+**Exit criteria:**
+- `pip install bigquery-agent-analytics-sdk[cli]` → `bq-agent-sdk --help`
+  works (smoke test in CI)
+- `bq-agent-sdk evaluate --last=1h --evaluator=latency --threshold=5000
+  --exit-code` returns exit code 1 on failure (integration test)
+- `bq-agent-sdk get-trace --session-id=X --format=json` returns valid JSON
+  (integration test)
+- Quickstart guide timed walkthrough completes in < 10 minutes
+- Sample GitHub Actions workflow passes with mock credentials
+
+#### Phase 3: Remote Function (2 weeks) — *v1.1*
 
 - [ ] Create `deploy/remote_function/` directory with:
       - `main.py` (functions-framework entry point)
@@ -1472,12 +1807,25 @@ Options:
       `drift`
 - [ ] Add Terraform/gcloud deployment automation
 - [ ] Write integration tests with BigQuery Remote Function simulator
-- [ ] Document deployment guide with IAM prerequisites
+- [ ] Document deployment guide with IAM prerequisites (see §5)
 
-### Phase 4: Continuous Query Templates (1 week)
+**Exit criteria:**
+- `deploy.sh` deploys to a test project and `SELECT agent_analytics('analyze',
+  JSON'{"session_id":"test"}')` returns valid JSON (end-to-end test)
+- Partial failure in a batch (1 of 5 calls errors) returns per-row error,
+  not batch-level 400 (integration test)
+- `deploy/remote_function/README.md` includes IAM roles, cost estimate,
+  and troubleshooting guide
+- Remote Function p95 latency < 5s for `analyze` operation (load test with
+  50 concurrent calls)
 
+#### Phase 4: CLI v1.1 Commands + Continuous Query Templates (2 weeks) — *v1.1/v1.2*
+
+- [ ] Implement remaining CLI commands: `insights`, `drift`, `distribution`,
+      `hitl-metrics`, `list-traces`, `views`
+- [ ] Document LLM tool-calling schema for agent integration
 - [ ] Create `deploy/continuous_queries/` directory with:
-      - `realtime_error_analysis.sql` — AI.GENERATE error classification
+      - `realtime_error_analysis.sql` — AI.GENERATE_TEXT error classification
       - `session_scoring.sql` — per-session quality scoring
       - `pubsub_alerting.sql` — critical error → Pub/Sub export
       - `bigtable_dashboard.sql` — session metrics → Bigtable
@@ -1487,7 +1835,14 @@ Options:
 - [ ] Add backfill guide (FOR SYSTEM_TIME AS OF → APPENDS handoff)
 - [ ] Document continuous query monitoring via INFORMATION_SCHEMA.JOBS
 
-### Phase 5: Documentation & Polish (1 week)
+**Exit criteria:**
+- All 9 CLI commands pass integration tests (mock BQ client)
+- Each continuous query template runs without syntax errors in BigQuery
+  dry-run mode (`--dry_run` flag)
+- Continuous query monitoring query returns job status for a running
+  template
+
+#### Phase 5: Documentation, Polish & Pilot (1 week) — *v1.0 GA*
 
 - [ ] Update SDK.md with CLI, Remote Function, and Continuous Query sections
 - [ ] Add `examples/cli_agent_tool.py` — example ADK agent using CLI as tool
@@ -1495,10 +1850,77 @@ Options:
 - [ ] Add `examples/remote_function_dashboard.sql` — example Looker queries
 - [ ] Add `examples/continuous_query_alerting.sql` — real-time error alerting
 - [ ] Update README.md with new interfaces
+- [ ] Run design-partner pilot (see §10)
+
+**Exit criteria:**
+- All examples run without errors against a test dataset
+- Pilot partners complete assigned CUJs within time targets (see §10.2)
+- Zero unresolved P0/P1 bugs from pilot feedback
+
+### 8.3 Migration / Onboarding Path
+
+**Python-only user today → CLI in 15 minutes → Remote Function in 1 day**
+
+#### Step 1: CLI (15 minutes)
+
+```bash
+# Install with CLI extra
+pip install bigquery-agent-analytics-sdk[cli]
+
+# Set environment variables (avoid repeating in every command)
+export BQ_AGENT_PROJECT=myproject
+export BQ_AGENT_DATASET=analytics
+
+# Health check
+bq-agent-sdk doctor
+
+# First evaluation
+bq-agent-sdk evaluate --evaluator=latency --threshold=5000 --last=1h
+
+# Retrieve a specific trace
+bq-agent-sdk get-trace --session-id=sess-001 --format=json
+```
+
+#### Step 2: CI/CD gate (30 minutes)
+
+```yaml
+# Add to .github/workflows/agent-eval.yml
+- name: Install SDK
+  run: pip install bigquery-agent-analytics-sdk[cli]
+
+- name: Gate on latency
+  run: bq-agent-sdk evaluate --evaluator=latency --threshold=5000 --last=24h --exit-code
+```
+
+#### Step 3: Remote Function (1 day)
+
+```bash
+# Clone and deploy
+git clone https://github.com/haiyuan-eng-google/BigQuery-Agent-Analytics-SDK.git
+cd BigQuery-Agent-Analytics-SDK/deploy/remote_function
+./deploy.sh --project=myproject --region=us-central1
+
+# Register in BigQuery (copy-paste from register.sql)
+bq query --use_legacy_sql=false < register.sql
+
+# First SQL evaluation
+bq query --use_legacy_sql=false \
+  "SELECT \`myproject.analytics.agent_analytics\`('analyze', JSON'{\"session_id\":\"sess-001\"}')"
+```
+
+#### Step 4: Continuous Query (optional, requires Enterprise edition)
+
+```bash
+# Deploy real-time error alerting template
+bq query --use_legacy_sql=false --continuous=true \
+  < deploy/continuous_queries/realtime_error_analysis.sql
+```
 
 ---
 
-## 6. Success Metrics
+## 9. Success Metrics
+
+### 9.1 Adoption Metrics
 
 | Metric | Target | Measurement |
 |--------|--------|-------------|
@@ -1510,9 +1932,56 @@ Options:
 | CI/CD integration | 3 orgs use `--exit-code` in pipelines | Community feedback |
 | Token savings for agents | 35x fewer tokens vs MCP schema loading (~4K vs ~145K); 60% fewer vs SQL generation | Benchmarked comparison against MCP baseline (see §4.1.1) |
 
+### 9.2 User Outcome Metrics
+
+| Outcome | Target | How Measured |
+|---------|--------|--------------|
+| **Mean time to detect agent regression** | < 15 minutes (from event to alert) | Continuous Query → Pub/Sub pipeline latency; CLI cron interval |
+| **MTTR reduction for agent incidents** | 30% reduction vs manual investigation | Before/after comparison during pilot (see §10) |
+| **Eval pipeline setup time** | < 1 hour for full CI/CD gate (evaluate + drift + exit-code) | Pilot partner timed walkthrough |
+| **SQL analyst unblocked** | Priya-persona can build dashboard without filing Python ticket | Pilot partner interview |
+| **Agent self-correction rate** | Agents using CLI self-diagnostics resolve 50% of tool failures without human intervention | Session trace analysis (self-correction loop detected) |
+
 ---
 
-## 7. Non-Goals (Out of Scope)
+## 10. Design-Partner Validation Plan
+
+### 10.1 Pilot Partners
+
+| Partner Profile | Persona | Focus Area | v1 Feature Set |
+|----------------|---------|------------|----------------|
+| **Analyst team** (1 data analyst / BI engineer) | Priya | Remote Function + Looker dashboard | `evaluate`, `analyze` via SQL |
+| **Agent team** (1 agent developer) | AgentX | CLI as agent tool for self-diagnostics | `evaluate`, `get-trace` via CLI |
+| **Platform team** (1 SRE / DevOps engineer) | Marcus | CI/CD pipeline with `--exit-code` | `evaluate`, `drift` via CLI + GitHub Actions |
+
+### 10.2 Pilot Success Criteria
+
+| Criterion | Measurement | Pass Threshold |
+|-----------|-------------|----------------|
+| Time-to-first-eval (CLI) | Timed from `pip install` to first `evaluate` output | < 10 minutes |
+| Time-to-first-eval (Remote Fn) | Timed from repo clone to first SQL `agent_analytics()` result | < 30 minutes |
+| Task completion without help | Pilot user completes assigned CUJ without asking SDK team questions | 2 out of 3 users |
+| Token overhead acceptable | Agent pilot measures context tokens consumed by CLI tool calls | < 5,000 tokens per CLI invocation |
+| CI/CD gate works end-to-end | Platform pilot configures `--exit-code` in real pipeline, blocks on failure | Blocks deploy on eval failure |
+| No P0 bugs | Pilot users report zero data-loss or incorrect evaluation results | 0 P0 bugs |
+
+### 10.3 Pilot Protocol
+
+1. **Week 1:** Onboard 3 pilot partners; provide quickstart guide + 30-min walkthrough
+2. **Weeks 2–3:** Partners use their assigned path independently; SDK team collects:
+   - Setup friction (where did they get stuck?)
+   - Feature gaps (what did they need that was missing?)
+   - Bug reports (severity-tagged)
+3. **Week 4:** Debrief interviews; collect NPS score (0–10) and written feedback
+4. **GA Decision Gate:** Proceed to GA if:
+   - All 3 pilots achieve time-to-first-eval targets
+   - NPS ≥ 7 for 2 out of 3 partners
+   - Zero unresolved P0/P1 bugs
+   - Documentation rated "sufficient" or better by all 3
+
+---
+
+## 11. Non-Goals (Out of Scope)
 
 - **Web UI / dashboard** — Use Looker/Data Studio with remote functions instead
 - **Real-time streaming** — SDK operates on stored BigQuery data; real-time is
@@ -1523,7 +1992,7 @@ Options:
 
 ---
 
-## 8. Open Questions
+## 12. Open Questions
 
 1. **CLI framework:** `click` vs `typer` — typer has better auto-generated
    help and type inference, but click has broader ecosystem support.
