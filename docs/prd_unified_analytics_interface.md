@@ -95,13 +95,16 @@ SDK features directly from `SELECT` statements.
 
 ### 3.2 Supported Operations
 
-| Remote Function | SDK Method | Input | Output |
-|----------------|-----------|-------|--------|
-| `analyze_session(session_id)` | `Client.get_trace()` + metrics | session_id STRING | JSON with span count, error count, latency, tool calls |
-| `evaluate_session(session_id, metric, threshold)` | `CodeEvaluator` | session_id, metric name, threshold | JSON with passed, score, details |
-| `judge_session(session_id, criterion)` | `LLMAsJudge` | session_id, criterion | JSON with score, feedback |
-| `session_insights(session_id)` | Facet extraction | session_id | JSON with intent, outcome, friction |
-| `check_drift(session_id, golden_dataset)` | Drift detection | session_id, golden table | JSON with coverage, gaps |
+All operations go through a single multiplexed function:
+`agent_analytics(operation STRING, params JSON) RETURNS JSON`
+
+| Operation | SDK Method | Params (JSON keys) | Output |
+|-----------|-----------|---------------------|--------|
+| `analyze` | `Client.get_session_trace()` + metrics | `session_id` | JSON with span count, error count, latency, tool calls |
+| `evaluate` | `CodeEvaluator` | `session_id`, `metric`, `threshold` | JSON with passed, score, details |
+| `judge` | `LLMAsJudge` | `session_id`, `criterion` | JSON with score, feedback |
+| `insights` | Facet extraction | `session_id` | JSON with intent, outcome, friction |
+| `drift` | Drift detection | `golden_dataset`, `agent_filter`, `start_date`, `end_date` | JSON with coverage, gaps |
 
 ### 3.3 Critical User Journeys (CUJ)
 
@@ -119,9 +122,10 @@ Step 1: Platform team deploys SDK as Cloud Function
             --entry-point handle_request \
             --source ./deploy/remote_function/
 
-Step 2: Platform team registers BigQuery Remote Function
-        CREATE FUNCTION `project.analytics.analyze_session`(
-          session_id STRING
+Step 2: Platform team registers a single multiplexed Remote Function
+        CREATE FUNCTION `project.analytics.agent_analytics`(
+          operation STRING,
+          params JSON
         ) RETURNS JSON
         REMOTE WITH CONNECTION `project.us.analytics-conn`
         OPTIONS (
@@ -131,29 +135,27 @@ Step 2: Platform team registers BigQuery Remote Function
 Step 3: Priya writes a scheduled query (no Python needed)
         -- Nightly materialization of agent quality scores
         CREATE OR REPLACE TABLE `project.analytics.daily_quality` AS
-        SELECT
-          session_id,
-          timestamp,
-          agent,
-          JSON_VALUE(
-            `project.analytics.analyze_session`(session_id),
-            '$.error_count'
-          ) AS error_count,
-          CAST(JSON_VALUE(
-            `project.analytics.analyze_session`(session_id),
-            '$.avg_latency_ms'
-          ) AS FLOAT64) AS avg_latency_ms,
-          JSON_VALUE(
-            `project.analytics.analyze_session`(session_id),
-            '$.tool_call_count'
-          ) AS tool_calls
-        FROM (
+        WITH recent AS (
           SELECT DISTINCT session_id, MIN(timestamp) AS timestamp,
                  ANY_VALUE(agent) AS agent
           FROM `project.analytics.agent_events`
           WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)
           GROUP BY session_id
-        );
+        )
+        SELECT
+          session_id,
+          timestamp,
+          agent,
+          JSON_VALUE(result, '$.error_count') AS error_count,
+          CAST(JSON_VALUE(result, '$.avg_latency_ms') AS FLOAT64) AS avg_latency_ms,
+          JSON_VALUE(result, '$.tool_call_count') AS tool_calls
+        FROM recent,
+        UNNEST([
+          `project.analytics.agent_analytics`(
+            'analyze',
+            JSON_OBJECT('session_id', session_id)
+          )
+        ]) AS result;
 
 Step 4: Priya connects Looker to `daily_quality` table
         → Dashboard shows latency trends, error rates, tool usage by agent
@@ -175,10 +177,13 @@ SELECT
   JSON_VALUE(result, '$.details') AS details
 FROM recent_sessions s,
 UNNEST([
-  `myproject.analytics.evaluate_session`(
-    s.session_id,
-    'latency',        -- metric
-    '5000'            -- threshold_ms
+  `myproject.analytics.agent_analytics`(
+    'evaluate',
+    JSON_OBJECT(
+      'session_id', s.session_id,
+      'metric', 'latency',
+      'threshold', 5000
+    )
   )
 ]) AS result;
 ```
@@ -211,9 +216,12 @@ FROM (
     AND timestamp >= '2026-03-01'
 ) sessions,
 UNNEST([
-  `myproject.analytics.judge_session`(
-    sessions.session_id,
-    'correctness'     -- criterion: correctness | hallucination | sentiment
+  `myproject.analytics.agent_analytics`(
+    'judge',
+    JSON_OBJECT(
+      'session_id', sessions.session_id,
+      'criterion', 'correctness'
+    )
   )
 ]) AS judgment
 WHERE CAST(JSON_VALUE(judgment, '$.score') AS FLOAT64) < 0.7
@@ -238,11 +246,14 @@ SELECT
   JSON_VALUE(drift_result, '$.total_production') AS prod_count,
   JSON_QUERY(drift_result, '$.uncovered_questions') AS gaps
 FROM UNNEST([
-  `myproject.analytics.check_drift`(
-    'myproject.analytics.golden_questions',   -- golden dataset table
-    'support_bot',                            -- agent filter
-    '2026-03-01',                             -- start date
-    '2026-03-06'                              -- end date
+  `myproject.analytics.agent_analytics`(
+    'drift',
+    JSON_OBJECT(
+      'golden_dataset', 'myproject.analytics.golden_questions',
+      'agent_filter', 'support_bot',
+      'start_date', '2026-03-01',
+      'end_date', '2026-03-06'
+    )
   )
 ]) AS drift_result;
 ```
@@ -288,10 +299,15 @@ FROM UNNEST([
 
 #### Entry Point (`deploy/remote_function/main.py`)
 
+A single multiplexed Cloud Function handles all operations. BigQuery sends
+`(operation STRING, params JSON)` tuples; the function dispatches to the
+appropriate SDK method and returns JSON results.
+
 ```python
 import functions_framework
 import json
-from bigquery_agent_analytics import Client, CodeEvaluator, LLMAsJudge
+import os
+from bigquery_agent_analytics import Client, CodeEvaluator, LLMAsJudge, TraceFilter
 
 # Initialized once per instance (cold start)
 client = Client(
@@ -304,18 +320,42 @@ def handle_request(request):
     body = request.get_json()
     replies = []
     for call in body["calls"]:
-        operation = call[0]
-        args = call[1:]
-        result = dispatch(operation, args)
+        operation, params_json = call[0], json.loads(call[1])
+        result = dispatch(operation, params_json)
         replies.append(json.dumps(result))
     return json.dumps({"replies": replies})
 
-def dispatch(operation, args):
+def dispatch(operation, params):
     if operation == "analyze":
-        return analyze_session(args[0])
+        trace = client.get_session_trace(params["session_id"])
+        return {
+            "span_count": len(trace.spans),
+            "error_count": len(trace.error_spans),
+            "avg_latency_ms": trace.total_latency_ms,
+            "tool_call_count": len(trace.tool_calls),
+            "final_response": trace.final_response,
+        }
     elif operation == "evaluate":
-        return evaluate_session(args[0], args[1], float(args[2]))
-    # ... etc
+        evaluator = CodeEvaluator.latency(threshold_ms=params["threshold"])
+        report = client.evaluate(evaluator=evaluator,
+            filters=TraceFilter(session_ids=[params["session_id"]]))
+        return report.details[0] if report.details else {}
+    elif operation == "judge":
+        judge = getattr(LLMAsJudge, params["criterion"])()
+        report = client.evaluate(evaluator=judge,
+            filters=TraceFilter(session_ids=[params["session_id"]]))
+        return report.details[0] if report.details else {}
+    elif operation == "drift":
+        report = client.drift_detection(
+            golden_dataset=params["golden_dataset"],
+            filters=TraceFilter(
+                agent_id=params.get("agent_filter"),
+                start_time=params.get("start_date"),
+                end_time=params.get("end_date"),
+            ))
+        return report.model_dump()
+    else:
+        return {"error": f"Unknown operation: {operation}"}
 ```
 
 ---
@@ -714,7 +754,7 @@ $ bq-agent-sdk views create-all \
     --dataset-id=analytics \
     --prefix=adk_
 
-Created 15 views:
+Created 18 views:
   ✓ adk_llm_requests
   ✓ adk_llm_responses
   ✓ adk_llm_errors
@@ -730,6 +770,9 @@ Created 15 views:
   ✓ adk_hitl_credential_requests
   ✓ adk_hitl_confirmation_requests
   ✓ adk_hitl_input_requests
+  ✓ adk_hitl_credential_completions
+  ✓ adk_hitl_confirmation_completions
+  ✓ adk_hitl_input_completions
 
 # Create a single view
 $ bq-agent-sdk views create LLM_RESPONSE \
@@ -987,6 +1030,8 @@ Options:
 
 | Metric | Target | Measurement |
 |--------|--------|-------------|
+| **Time-to-first-value (CLI)** | First CLI eval run in < 10 minutes from `pip install` | Timed walkthrough in quickstart guide |
+| **Time-to-first-value (Remote Fn)** | First SQL `agent_analytics()` call in < 30 minutes from repo clone | Timed deploy + query walkthrough |
 | CLI adoption | 20% of SDK users use CLI within 3 months | PyPI download stats for `[cli]` extra |
 | Remote Function deployments | 10 production deployments within 6 months | Deployment telemetry |
 | Agent tool integration | 5 agents use CLI for self-diagnostics | Community feedback / GitHub issues |
@@ -1016,10 +1061,11 @@ Options:
    require users to have Application Default Credentials configured?
    **Recommendation:** Require ADC; add `bq-agent-sdk auth check` command.
 
-3. **Remote function granularity:** One function per operation vs one
-   multiplexed function?
-   **Recommendation:** One multiplexed function with operation parameter
-   (simpler deployment, single connection).
+3. **Remote function granularity:** ~~One function per operation vs one
+   multiplexed function?~~
+   **Decided:** One multiplexed function `agent_analytics(operation, params)`
+   (simpler deployment, single connection). All CUJs and examples in this
+   document use this approach.
 
 4. **Versioning:** Should the CLI version be tied to the SDK version?
    **Recommendation:** Yes, single version number for all interfaces.
