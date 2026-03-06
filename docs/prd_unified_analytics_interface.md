@@ -52,7 +52,7 @@ import the library. This creates three gaps:
 │ (existing)    │ (Path A — Batch)   │ (Path A' — Stream) │ (Path B — Agent)  │
 │               │                    │                    │                   │
 │ import Client │ SELECT fn(...)     │ APPENDS() +        │ $ bq-agent-sdk    │
-│ Notebooks     │ Scheduled queries  │ AI.GENERATE        │   evaluate ...    │
+│ Notebooks     │ Scheduled queries  │ AI.GENERATE_TEXT   │   evaluate ...    │
 │ Python apps   │ Looker, dashboards │ → BQ / Pub/Sub /   │   insights ...    │
 │               │                    │   Bigtable / Spanner│                   │
 └───────────────┴────────────────────┴────────────────────┴────────────────────┘
@@ -547,7 +547,7 @@ Spanner — enabling real-time, event-driven analytics over agent traces.
 | **Trigger** | Automatically fires on new rows via `APPENDS(TABLE ..., start_timestamp)` |
 | **Destinations** | `INSERT INTO` (BigQuery table), `EXPORT DATA` (Pub/Sub, Bigtable, Spanner) |
 | **AI functions** | `AI.GENERATE_TEXT` and `ML.GENERATE_TEXT` — supported for remote models (Gemini, etc.). `AI.GENERATE_TABLE` — **not supported** in continuous queries. `ML.UNDERSTAND_TEXT`, `ML.TRANSLATE` — supported. See [supported AI functions in CQ](https://cloud.google.com/bigquery/docs/continuous-queries-introduction#supported_statements). |
-| **Remote functions** | **Not supported** — continuous queries cannot call user-defined remote functions (CREATE FUNCTION ... REMOTE) |
+| **Remote functions** | **Not supported** — continuous queries cannot call user-defined remote functions (`CREATE FUNCTION ... REMOTE`) because remote functions are UDF routines, and CQ disallows all UDFs |
 | **SQL restrictions** | No `JOIN`, `GROUP BY`, `DISTINCT`, aggregates, window functions, `ORDER BY`, `LIMIT` |
 | **Execution** | `bq query --continuous=true` or API `"continuous": true` — not a DDL statement |
 | **Reservation** | Requires Enterprise / Enterprise Plus edition with `CONTINUOUS` job type assignment (max 500 slots) |
@@ -558,21 +558,21 @@ Spanner — enabling real-time, event-driven analytics over agent traces.
 
 The ADK plugin writes events to the `agent_events` table via the BigQuery
 Storage Write API. A continuous query can monitor this table in real-time
-and apply `AI.GENERATE` — the same LLM evaluation engine the SDK uses —
-to score, classify, or flag every session as events arrive. **No Cloud
-Function deployment needed; pure SQL.**
+and apply `AI.GENERATE_TEXT` — the same LLM evaluation engine the SDK
+uses — to score, classify, or flag every session as events arrive. **No
+Cloud Function deployment needed; pure SQL.**
 
 This creates a third analytics path:
 
 ```
 Path A:  Remote Function   → batch SQL analytics via Cloud Function
-Path A': Continuous Query   → real-time streaming analytics via AI.GENERATE
+Path A': Continuous Query   → real-time streaming analytics via AI.GENERATE_TEXT
 Path B:  CLI               → agent self-diagnostics and CI/CD
 ```
 
 ### 3A.2 Critical User Journeys (CUJ)
 
-#### CUJ-A4: Priya Builds Real-Time Error Alerting with Continuous Query + AI.GENERATE
+#### CUJ-A4: Priya Builds Real-Time Error Alerting with Continuous Query + AI.GENERATE_TEXT
 
 **Goal:** Every time an agent session ends with an error, automatically
 classify the failure root cause using Gemini and push an alert to Pub/Sub
@@ -582,11 +582,11 @@ streaming SQL.
 **Architecture:**
 
 ```
-┌──────────────┐    ┌─────────────────────────┐    ┌──────────────┐
-│  ADK Plugin  │───▶│  agent_events table      │───▶│  Continuous  │
-│  (writes     │    │  (BigQuery)              │    │  Query       │
-│   events)    │    │                          │    │  + AI.GENERATE│
-└──────────────┘    └─────────────────────────┘    └──────┬───────┘
+┌──────────────┐    ┌─────────────────────────┐    ┌────────────────┐
+│  ADK Plugin  │───▶│  agent_events table      │───▶│  Continuous    │
+│  (writes     │    │  (BigQuery)              │    │  Query + AI.   │
+│   events)    │    │                          │    │  GENERATE_TEXT │
+└──────────────┘    └─────────────────────────┘    └──────┬─────────┘
                                                           │
                                           ┌───────────────┼───────────────┐
                                           ▼               ▼               ▼
@@ -799,7 +799,7 @@ AS (
 | Scenario | Path | Why |
 |----------|------|-----|
 | Nightly batch evaluation of all sessions | **Remote Function** (Path A) | Needs JOINs, GROUP BY, aggregation — not supported in continuous queries |
-| Real-time error classification as events arrive | **Continuous Query** (Path A') | Stateless per-row processing; AI.GENERATE on each error; no deployment needed |
+| Real-time error classification as events arrive | **Continuous Query** (Path A') | Stateless per-row processing; AI.GENERATE_TEXT on each error; no deployment needed |
 | Dashboard with sub-second latency | **Continuous Query → Bigtable** | EXPORT DATA to Bigtable for low-latency reads |
 | Alert on critical errors via Slack/PagerDuty | **Continuous Query → Pub/Sub** | EXPORT DATA to Pub/Sub with severity-based attributes |
 | Agent self-diagnostic before responding | **CLI** (Path B) | Agent calls `bq-agent-sdk evaluate` as a tool |
@@ -1267,7 +1267,7 @@ $ bq-agent-sdk doctor \
 ║   HITL_CONFIRMATION_REQ       42                 ║
 ║   STATE_DELTA                310                 ║
 ║                                                  ║
-║ AI.GENERATE: ✓ Available (gemini-2.5-flash)      ║
+║ AI.GENERATE_TEXT: ✓ (gemini-2.5-flash)            ║
 ║ Connection:  ✓ us-central1.analytics-conn        ║
 ║                                                  ║
 ║ Warnings:                                        ║
@@ -1594,7 +1594,7 @@ gcloud projects add-iam-policy-binding PROJECT \
 |------|----------|-----|
 | `roles/bigquery.dataEditor` | `analytics` dataset | Read `agent_events`, write analysis tables |
 | `roles/bigquery.jobUser` | Project | Run continuous query jobs |
-| `roles/bigquery.connectionUser` | Connection | Invoke AI.GENERATE via remote model connection |
+| `roles/bigquery.connectionUser` | Connection | Invoke AI.GENERATE_TEXT via remote model connection |
 
 ### 5.2 CLI Authentication
 
@@ -1637,7 +1637,7 @@ Costs assume US multi-region, on-demand pricing (March 2026).
 |----------|--------|----------------------|
 | **Small** (dev/test) | 10K sessions, CLI only | < $1 (BQ scan only) |
 | **Medium** (production) | 100K sessions, CLI + Remote Fn + nightly eval | ~$15 (BQ scan + Cloud Function) |
-| **Large** (streaming) | 500K sessions, all paths + Continuous Query | ~$700 (dominated by CQ reservation + AI.GENERATE) |
+| **Large** (streaming) | 500K sessions, all paths + Continuous Query | ~$700 (dominated by CQ reservation + AI.GENERATE_TEXT) |
 
 ### 6.3 Cost Optimization
 
@@ -1646,8 +1646,8 @@ Costs assume US multi-region, on-demand pricing (March 2026).
   which prunes partitions, reducing scan cost by 90%+.
 - **Materialized views:** Cache `daily_quality` table to avoid re-scanning
   raw events.
-- **AI.GENERATE batching:** Continuous queries process rows as they arrive;
-  no additional batching optimization needed.
+- **AI.GENERATE_TEXT batching:** Continuous queries process rows as they
+  arrive; no additional batching optimization needed.
 - **Slot reservations:** For continuous queries, a FLEX reservation (per-minute
   billing) is cheaper than on-demand for sustained workloads.
 
@@ -1675,7 +1675,7 @@ Costs assume US multi-region, on-demand pricing (March 2026).
 |------|----------------|
 | **CLI** | No automatic retry. User re-runs command. `--exit-code` returns 2 for infra errors (vs 1 for eval failure). |
 | **Remote Function** | BigQuery automatically retries on HTTP 408, 429, 500, 503, 504. The Cloud Function must be **idempotent** for a given `(requestId, call_index)` pair. Non-retryable errors return HTTP 400. |
-| **Continuous Query** | BigQuery restarts failed continuous queries automatically. If a row fails AI.GENERATE, the row is skipped (no dead-letter). Monitor via `INFORMATION_SCHEMA.JOBS`. |
+| **Continuous Query** | BigQuery restarts failed continuous queries automatically. If a row fails AI.GENERATE_TEXT, the row is skipped (no dead-letter). Monitor via `INFORMATION_SCHEMA.JOBS`. |
 
 ### 7.3 Operational Runbook: "What Happens When It Fails"
 
@@ -1693,7 +1693,7 @@ Costs assume US multi-region, on-demand pricing (March 2026).
 
 | Failure | Symptom | Diagnosis | Resolution |
 |---------|---------|-----------|------------|
-| **AI.GENERATE quota** | Query pauses / slows | `INFORMATION_SCHEMA.JOBS` → error message | Increase Vertex AI quota; reduce `max_output_tokens` |
+| **AI.GENERATE_TEXT quota** | Query pauses / slows | `INFORMATION_SCHEMA.JOBS` → error message | Increase Vertex AI quota; reduce `max_output_tokens` |
 | **Reservation exhausted** | Query queued, not processing | Reservation monitor → slot utilization | Add FLEX slots or reduce concurrent CQ count |
 | **Query exceeds 2-day limit** | Query stops | `INFORMATION_SCHEMA.JOBS` → end_time | Use service account (150-day limit); set up auto-restart cron |
 | **Destination table schema mismatch** | Insert fails | CQ error log → schema error | ALTER TABLE to add new columns; restart CQ |
@@ -1830,7 +1830,7 @@ minimum surface that unblocks all three personas:
       - `pubsub_alerting.sql` — critical error → Pub/Sub export
       - `bigtable_dashboard.sql` — session metrics → Bigtable
       - `setup_reservation.md` — Enterprise reservation guide
-- [ ] Document AI.GENERATE prompt templates aligned with SDK evaluation
+- [ ] Document AI.GENERATE_TEXT prompt templates aligned with SDK evaluation
       criteria (correctness, hallucination, sentiment)
 - [ ] Add backfill guide (FOR SYSTEM_TIME AS OF → APPENDS handoff)
 - [ ] Document continuous query monitoring via INFORMATION_SCHEMA.JOBS
@@ -1984,8 +1984,10 @@ bq query --use_legacy_sql=false --continuous=true \
 ## 11. Non-Goals (Out of Scope)
 
 - **Web UI / dashboard** — Use Looker/Data Studio with remote functions instead
-- **Real-time streaming** — SDK operates on stored BigQuery data; real-time is
-  the plugin's job
+- **Custom real-time processing** — The SDK does not build a streaming
+  pipeline. Real-time analytics are handled via BigQuery Continuous Query
+  templates (Path A', §3A) which use native `AI.GENERATE_TEXT` — the SDK
+  provides SQL templates but no custom runtime
 - **Agent framework integration** — The CLI is framework-agnostic; specific ADK
   tool wrappers are a separate effort
 - **Multi-cloud** — BigQuery-only for now
