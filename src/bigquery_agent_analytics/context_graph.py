@@ -33,6 +33,9 @@ Key capabilities:
 - **World Change detection** — Compare business entities evaluated at
   agent-execution time against current availability to detect stale
   context in long-running A2A tasks.
+- **Decision Semantics** — Model agent decision points with candidates,
+  scores, selection/rejection status, and rejection rationale for
+  EU audit compliance.
 
 Example usage::
 
@@ -100,6 +103,59 @@ class BizNode:
   evaluated_at: Optional[datetime] = None
   artifact_uri: Optional[str] = None
   metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DecisionPoint:
+  """A decision point identified in an agent trace.
+
+  Represents a moment where the agent evaluated multiple candidates
+  and selected or rejected them based on scores and criteria.
+
+  Attributes:
+      decision_id: Unique identifier for this decision point.
+      session_id: Session that contains this decision.
+      span_id: The span where the decision was made.
+      decision_type: Category of decision (e.g. "audience_selection",
+          "placement_selection", "budget_allocation").
+      description: Human-readable description of the decision.
+      timestamp: When the decision was made.
+      metadata: Additional decision metadata.
+  """
+
+  decision_id: str
+  session_id: str
+  span_id: str
+  decision_type: str
+  description: str = ""
+  timestamp: Optional[datetime] = None
+  metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Candidate:
+  """A candidate option evaluated at a decision point.
+
+  Attributes:
+      candidate_id: Unique identifier for this candidate.
+      decision_id: The decision point this candidate belongs to.
+      session_id: Session containing this candidate.
+      name: Candidate name/label.
+      score: Evaluation score (0.0-1.0).
+      status: "SELECTED" or "DROPPED".
+      rejection_rationale: Why the candidate was dropped (required for
+          DROPPED candidates, supports EU audit compliance).
+      properties: Additional candidate properties (e.g. reach, cost).
+  """
+
+  candidate_id: str
+  decision_id: str
+  session_id: str
+  name: str
+  score: float = 0.0
+  status: str = "SELECTED"
+  rejection_rationale: Optional[str] = None
+  properties: dict[str, Any] = field(default_factory=dict)
 
 
 class WorldChangeAlert(BaseModel):
@@ -196,6 +252,9 @@ class ContextGraphConfig(BaseModel):
 
   biz_nodes_table: str = Field(default="extracted_biz_nodes")
   cross_links_table: str = Field(default="context_cross_links")
+  decision_points_table: str = Field(default="decision_points")
+  candidates_table: str = Field(default="candidates")
+  decision_edges_table: str = Field(default="decision_edges")
   graph_name: str = Field(default="agent_context_graph")
   endpoint: str = Field(default="gemini-2.5-flash")
   entity_types: list[str] = Field(
@@ -221,6 +280,17 @@ _BIZ_NODE_OUTPUT_SCHEMA = (
     '{"entity_type": {"type": "STRING"}, '
     '"entity_value": {"type": "STRING"}, '
     '"confidence": {"type": "NUMBER"}}}}'
+)
+
+_DECISION_POINT_OUTPUT_SCHEMA = (
+    '{"type": "ARRAY", "items": {"type": "OBJECT", "properties": '
+    '{"decision_type": {"type": "STRING"}, '
+    '"description": {"type": "STRING"}, '
+    '"candidates": {"type": "ARRAY", "items": {"type": "OBJECT", '
+    '"properties": {"name": {"type": "STRING"}, '
+    '"score": {"type": "NUMBER"}, '
+    '"status": {"type": "STRING"}, '
+    '"rejection_rationale": {"type": "STRING"}}}}}}}'
 )
 
 # ------------------------------------------------------------------ #
@@ -373,6 +443,146 @@ SELECT
   CURRENT_TIMESTAMP() AS created_at
 FROM `{project}.{dataset}.{biz_table}` b
 WHERE b.session_id IN UNNEST(@session_ids)
+"""
+
+_CREATE_DECISION_POINTS_TABLE_QUERY = """\
+CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{decision_points_table}` (
+  decision_id STRING,
+  session_id STRING,
+  span_id STRING,
+  decision_type STRING,
+  description STRING
+)
+"""
+
+_CREATE_CANDIDATES_TABLE_QUERY = """\
+CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{candidates_table}` (
+  candidate_id STRING,
+  decision_id STRING,
+  session_id STRING,
+  name STRING,
+  score FLOAT64,
+  status STRING,
+  rejection_rationale STRING
+)
+"""
+
+_CREATE_DECISION_EDGES_TABLE_QUERY = """\
+CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{decision_edges_table}` (
+  edge_id STRING,
+  source_id STRING,
+  destination_id STRING,
+  edge_type STRING,
+  rejection_rationale STRING,
+  created_at TIMESTAMP
+)
+"""
+
+_EXTRACT_DECISION_POINTS_QUERY = """\
+SELECT
+  base.span_id,
+  base.session_id,
+  base.event_type,
+  COALESCE(
+    JSON_EXTRACT_SCALAR(base.content, '$.text_summary'),
+    JSON_EXTRACT_SCALAR(base.content, '$.response'),
+    JSON_EXTRACT_SCALAR(base.content, '$.text'),
+    TO_JSON_STRING(base.content)
+  ) AS payload_text
+FROM `{project}.{dataset}.{table}` AS base
+WHERE base.session_id IN UNNEST(@session_ids)
+  AND base.event_type IN (
+    'LLM_RESPONSE',
+    'TOOL_COMPLETED',
+    'AGENT_COMPLETED',
+    'HITL_CONFIRMATION_REQUEST_COMPLETED'
+  )
+  AND base.content IS NOT NULL
+ORDER BY base.timestamp ASC
+"""
+
+_DELETE_DECISION_POINTS_FOR_SESSIONS_QUERY = """\
+DELETE FROM `{project}.{dataset}.{decision_points_table}`
+WHERE session_id IN UNNEST(@session_ids)
+"""
+
+_DELETE_CANDIDATES_FOR_SESSIONS_QUERY = """\
+DELETE FROM `{project}.{dataset}.{candidates_table}`
+WHERE session_id IN UNNEST(@session_ids)
+"""
+
+_DELETE_DECISION_EDGES_FOR_SESSIONS_QUERY = """\
+DELETE FROM `{project}.{dataset}.{decision_edges_table}`
+WHERE edge_id LIKE CONCAT('%', session_id_param, '%')
+"""
+
+_INSERT_DECISION_EDGES_QUERY = """\
+INSERT INTO `{project}.{dataset}.{decision_edges_table}`
+  (edge_id, source_id, destination_id, edge_type,
+   rejection_rationale, created_at)
+SELECT
+  CONCAT(dp.span_id, ':MADE_DECISION:', dp.decision_id) AS edge_id,
+  dp.span_id AS source_id,
+  dp.decision_id AS destination_id,
+  'MADE_DECISION' AS edge_type,
+  CAST(NULL AS STRING) AS rejection_rationale,
+  CURRENT_TIMESTAMP() AS created_at
+FROM `{project}.{dataset}.{decision_points_table}` dp
+WHERE dp.session_id IN UNNEST(@session_ids)
+
+UNION ALL
+
+SELECT
+  CONCAT(c.decision_id, ':', c.status, ':', c.candidate_id) AS edge_id,
+  c.decision_id AS source_id,
+  c.candidate_id AS destination_id,
+  CASE c.status
+    WHEN 'SELECTED' THEN 'SELECTED_CANDIDATE'
+    ELSE 'DROPPED_CANDIDATE'
+  END AS edge_type,
+  c.rejection_rationale,
+  CURRENT_TIMESTAMP() AS created_at
+FROM `{project}.{dataset}.{candidates_table}` c
+WHERE c.session_id IN UNNEST(@session_ids)
+"""
+
+_DECISION_POINTS_FOR_SESSION_QUERY = """\
+SELECT
+  dp.decision_id,
+  dp.session_id,
+  dp.span_id,
+  dp.decision_type,
+  dp.description
+FROM `{project}.{dataset}.{decision_points_table}` dp
+WHERE dp.session_id = @session_id
+"""
+
+_CANDIDATES_FOR_DECISION_QUERY = """\
+SELECT
+  c.candidate_id,
+  c.decision_id,
+  c.session_id,
+  c.name,
+  c.score,
+  c.status,
+  c.rejection_rationale
+FROM `{project}.{dataset}.{candidates_table}` c
+WHERE c.decision_id = @decision_id
+ORDER BY c.score DESC
+"""
+
+_CANDIDATES_FOR_SESSION_QUERY = """\
+SELECT
+  c.candidate_id,
+  c.decision_id,
+  c.session_id,
+  c.name,
+  c.score,
+  c.status,
+  c.rejection_rationale
+FROM `{project}.{dataset}.{candidates_table}` c
+WHERE c.session_id = @session_id
+ORDER BY c.decision_id, c.score DESC
 """
 
 _PROPERTY_GRAPH_DDL = """\
@@ -537,6 +747,141 @@ JOIN `{project}.{dataset}.{table}` e
   ON b.span_id = e.span_id
 WHERE b.session_id = @session_id
 ORDER BY e.timestamp ASC
+"""
+
+# ------------------------------------------------------------------ #
+# Decision Semantics: Extended Property Graph DDL                      #
+# ------------------------------------------------------------------ #
+
+_DECISION_PROPERTY_GRAPH_DDL = """\
+CREATE OR REPLACE PROPERTY GRAPH `{project}.{dataset}.{graph_name}`
+  NODE TABLES (
+    -- Technical execution nodes (spans from ADK plugin)
+    `{project}.{dataset}.{table}` AS TechNode
+      KEY (span_id)
+      LABEL TechNode
+      PROPERTIES (
+        event_type,
+        agent,
+        timestamp,
+        session_id,
+        invocation_id,
+        content,
+        latency_ms,
+        status,
+        error_message
+      ),
+    -- Business domain nodes (extracted entities)
+    `{project}.{dataset}.{biz_table}` AS BizNode
+      KEY (biz_node_id)
+      LABEL BizNode
+      PROPERTIES (
+        node_type,
+        node_value,
+        confidence,
+        session_id,
+        span_id,
+        artifact_uri
+      ),
+    -- Decision point nodes
+    `{project}.{dataset}.{decision_points_table}` AS DecisionPoint
+      KEY (decision_id)
+      LABEL DecisionPoint
+      PROPERTIES (
+        session_id,
+        span_id,
+        decision_type,
+        description
+      ),
+    -- Candidate nodes
+    `{project}.{dataset}.{candidates_table}` AS CandidateNode
+      KEY (candidate_id)
+      LABEL CandidateNode
+      PROPERTIES (
+        decision_id,
+        session_id,
+        name,
+        score,
+        status,
+        rejection_rationale
+      )
+  )
+  EDGE TABLES (
+    -- Causal lineage: parent span -> child span
+    `{project}.{dataset}.{table}` AS Caused
+      KEY (span_id)
+      SOURCE KEY (parent_span_id) REFERENCES TechNode (span_id)
+      DESTINATION KEY (span_id) REFERENCES TechNode (span_id)
+      LABEL Caused,
+
+    -- Cross-link: technical event -> business entity it evaluated
+    `{project}.{dataset}.{cross_links_table}` AS Evaluated
+      KEY (link_id)
+      SOURCE KEY (span_id) REFERENCES TechNode (span_id)
+      DESTINATION KEY (biz_node_id) REFERENCES BizNode (biz_node_id)
+      LABEL Evaluated
+      PROPERTIES (
+        artifact_uri,
+        link_type,
+        created_at
+      ),
+
+    -- Decision edges: TechNode -> DecisionPoint, DecisionPoint -> Candidate
+    `{project}.{dataset}.{decision_edges_table}` AS DecisionEdge
+      KEY (edge_id)
+      SOURCE KEY (source_id) REFERENCES DecisionPoint (decision_id)
+      DESTINATION KEY (destination_id) REFERENCES CandidateNode (candidate_id)
+      LABEL DecisionEdge
+      PROPERTIES (
+        edge_type,
+        rejection_rationale,
+        created_at
+      )
+  )
+"""
+
+# ------------------------------------------------------------------ #
+# Decision Semantics: GQL Queries                                      #
+# ------------------------------------------------------------------ #
+
+_GQL_EU_AUDIT_QUERY = """\
+GRAPH `{project}.{dataset}.{graph_name}`
+MATCH
+  (tech:TechNode)-[c:Caused]->{{1,{max_hops}}}(step:TechNode),
+  (dp:DecisionPoint WHERE dp.span_id = step.span_id)
+    <-[de:DecisionEdge]-(cand:CandidateNode)
+WHERE tech.session_id = @session_id
+  {decision_type_clause}
+RETURN
+  dp.decision_id,
+  dp.decision_type,
+  dp.description AS decision_description,
+  cand.name AS candidate_name,
+  cand.score AS candidate_score,
+  cand.status AS candidate_status,
+  cand.rejection_rationale,
+  step.span_id,
+  step.event_type,
+  step.agent
+ORDER BY dp.decision_id, cand.score DESC
+LIMIT @result_limit
+"""
+
+_GQL_DROPPED_CANDIDATES_QUERY = """\
+GRAPH `{project}.{dataset}.{graph_name}`
+MATCH
+  (dp:DecisionPoint)<-[de:DecisionEdge]-(cand:CandidateNode)
+WHERE dp.session_id = @session_id
+  AND cand.status = 'DROPPED'
+RETURN
+  dp.decision_id,
+  dp.decision_type,
+  dp.description AS decision_description,
+  cand.name AS candidate_name,
+  cand.score AS candidate_score,
+  cand.rejection_rationale
+ORDER BY dp.decision_id, cand.score DESC
+LIMIT @result_limit
 """
 
 
@@ -1349,6 +1694,418 @@ class ContextGraphManager:
         stale_entities=stale_count,
         is_safe_to_approve=(stale_count == 0),
     )
+
+  # -------------------------------------------------------------- #
+  # Decision Semantics                                               #
+  # -------------------------------------------------------------- #
+
+  def _ensure_decision_tables(self) -> None:
+    """Creates decision_points, candidates, and decision_edges tables."""
+    fmt = {
+        "project": self.project_id,
+        "dataset": self.dataset_id,
+        "decision_points_table": self.config.decision_points_table,
+        "candidates_table": self.config.candidates_table,
+        "decision_edges_table": self.config.decision_edges_table,
+    }
+    for ddl_template in (
+        _CREATE_DECISION_POINTS_TABLE_QUERY,
+        _CREATE_CANDIDATES_TABLE_QUERY,
+        _CREATE_DECISION_EDGES_TABLE_QUERY,
+    ):
+      job = self.client.query(ddl_template.format(**fmt))
+      job.result()
+
+  def extract_decision_points(
+      self,
+      session_ids: list[str],
+  ) -> tuple[list[DecisionPoint], list[Candidate]]:
+    """Extracts decision points and candidates from agent traces.
+
+    Fetches relevant payloads from agent events and returns them
+    for client-side extraction.  Use ``store_decision_points``
+    to persist the results after extraction.
+
+    Args:
+        session_ids: Sessions to extract decision points from.
+
+    Returns:
+        A tuple of (decision_points, candidates) lists.
+    """
+    query = _EXTRACT_DECISION_POINTS_QUERY.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        table=self.table_id,
+    )
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "session_ids", "STRING", session_ids
+            ),
+        ]
+    )
+
+    try:
+      job = self.client.query(query, job_config=job_config)
+      rows = list(job.result())
+      logger.info(
+          "Fetched %d candidate payloads for decision extraction",
+          len(rows),
+      )
+      return [], []
+    except Exception as e:
+      logger.warning("Decision point extraction failed: %s", e)
+      return [], []
+
+  def store_decision_points(
+      self,
+      decision_points: list[DecisionPoint],
+      candidates: list[Candidate],
+  ) -> bool:
+    """Stores pre-extracted decision points and candidates.
+
+    Args:
+        decision_points: List of DecisionPoint objects.
+        candidates: List of Candidate objects.
+
+    Returns:
+        True if successful.
+    """
+    if not decision_points and not candidates:
+      return True
+
+    try:
+      self._ensure_decision_tables()
+    except Exception as e:
+      logger.warning("Failed to create decision tables: %s", e)
+      return False
+
+    if decision_points:
+      dp_rows = [
+          {
+              "decision_id": dp.decision_id,
+              "session_id": dp.session_id,
+              "span_id": dp.span_id,
+              "decision_type": dp.decision_type,
+              "description": dp.description,
+          }
+          for dp in decision_points
+      ]
+      dp_table = (
+          f"{self.project_id}.{self.dataset_id}"
+          f".{self.config.decision_points_table}"
+      )
+      try:
+        errors = self.client.insert_rows_json(dp_table, dp_rows)
+        if errors:
+          logger.error("Failed to insert decision points: %s", errors)
+          return False
+      except Exception as e:
+        logger.warning("Failed to store decision points: %s", e)
+        return False
+
+    if candidates:
+      cand_rows = [
+          {
+              "candidate_id": c.candidate_id,
+              "decision_id": c.decision_id,
+              "session_id": c.session_id,
+              "name": c.name,
+              "score": c.score,
+              "status": c.status,
+              "rejection_rationale": c.rejection_rationale,
+          }
+          for c in candidates
+      ]
+      cand_table = (
+          f"{self.project_id}.{self.dataset_id}"
+          f".{self.config.candidates_table}"
+      )
+      try:
+        errors = self.client.insert_rows_json(cand_table, cand_rows)
+        if errors:
+          logger.error("Failed to insert candidates: %s", errors)
+          return False
+      except Exception as e:
+        logger.warning("Failed to store candidates: %s", e)
+        return False
+
+    logger.info(
+        "Stored %d decision points, %d candidates",
+        len(decision_points), len(candidates),
+    )
+    return True
+
+  def create_decision_edges(
+      self,
+      session_ids: list[str],
+  ) -> bool:
+    """Creates MADE_DECISION, SELECTED_CANDIDATE, and DROPPED_CANDIDATE edges.
+
+    Args:
+        session_ids: Sessions to create decision edges for.
+
+    Returns:
+        True if successful.
+    """
+    try:
+      self._ensure_decision_tables()
+    except Exception as e:
+      logger.warning("Failed to create decision tables: %s", e)
+      return False
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "session_ids", "STRING", session_ids
+            ),
+        ]
+    )
+
+    insert_query = _INSERT_DECISION_EDGES_QUERY.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        decision_points_table=self.config.decision_points_table,
+        candidates_table=self.config.candidates_table,
+        decision_edges_table=self.config.decision_edges_table,
+    )
+
+    try:
+      job = self.client.query(insert_query, job_config=job_config)
+      job.result()
+      logger.info(
+          "Decision edges created for %d sessions", len(session_ids)
+      )
+      return True
+    except Exception as e:
+      logger.warning("Failed to create decision edges: %s", e)
+      return False
+
+  def get_decision_property_graph_ddl(
+      self,
+      graph_name: Optional[str] = None,
+  ) -> str:
+    """Returns Property Graph DDL with Decision Semantics extension.
+
+    This extends the base 4-pillar DDL with DecisionPoint and
+    Candidate node tables and decision edge tables.
+
+    Args:
+        graph_name: Override the default graph name.
+
+    Returns:
+        The DDL SQL string.
+    """
+    name = graph_name or self.config.graph_name
+    return _DECISION_PROPERTY_GRAPH_DDL.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        table=self.table_id,
+        biz_table=self.config.biz_nodes_table,
+        cross_links_table=self.config.cross_links_table,
+        decision_points_table=self.config.decision_points_table,
+        candidates_table=self.config.candidates_table,
+        decision_edges_table=self.config.decision_edges_table,
+        graph_name=name,
+    )
+
+  def get_eu_audit_gql(
+      self,
+      session_id: Optional[str] = None,
+      decision_type: Optional[str] = None,
+      graph_name: Optional[str] = None,
+      max_hops: Optional[int] = None,
+      result_limit: int = 200,
+  ) -> str:
+    """Returns a GQL query for EU audit trail traversal.
+
+    Traces decision points back through reasoning chains to find
+    all candidates (selected and dropped) with rejection rationale.
+
+    Args:
+        session_id: Session to audit.
+        decision_type: Optional filter for decision type.
+        graph_name: Override graph name.
+        max_hops: Override max causal hops.
+        result_limit: Maximum results.
+
+    Returns:
+        The GQL query string.
+    """
+    name = graph_name or self.config.graph_name
+    hops = max_hops or self.config.max_hops
+
+    decision_type_clause = ""
+    if decision_type:
+      decision_type_clause = (
+          "AND dp.decision_type = @decision_type"
+      )
+
+    return _GQL_EU_AUDIT_QUERY.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        graph_name=name,
+        max_hops=hops,
+        decision_type_clause=decision_type_clause,
+    )
+
+  def get_dropped_candidates_gql(
+      self,
+      graph_name: Optional[str] = None,
+      result_limit: int = 200,
+  ) -> str:
+    """Returns a GQL query for dropped candidates with rationale.
+
+    Args:
+        graph_name: Override graph name.
+        result_limit: Maximum results.
+
+    Returns:
+        The GQL query string.
+    """
+    name = graph_name or self.config.graph_name
+    return _GQL_DROPPED_CANDIDATES_QUERY.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        graph_name=name,
+    )
+
+  def get_decision_points_for_session(
+      self,
+      session_id: str,
+  ) -> list[DecisionPoint]:
+    """Returns all decision points for a session.
+
+    Args:
+        session_id: Session to query.
+
+    Returns:
+        List of DecisionPoint objects.
+    """
+    query = _DECISION_POINTS_FOR_SESSION_QUERY.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        decision_points_table=self.config.decision_points_table,
+    )
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "session_id", "STRING", session_id
+            ),
+        ]
+    )
+    try:
+      job = self.client.query(query, job_config=job_config)
+      rows = list(job.result())
+      return [
+          DecisionPoint(
+              decision_id=row.get("decision_id", ""),
+              session_id=row.get("session_id", ""),
+              span_id=row.get("span_id", ""),
+              decision_type=row.get("decision_type", ""),
+              description=row.get("description", ""),
+          )
+          for row in rows
+      ]
+    except Exception as e:
+      logger.warning(
+          "Failed to get decision points for session %s: %s",
+          session_id, e,
+      )
+      return []
+
+  def get_candidates_for_decision(
+      self,
+      decision_id: str,
+  ) -> list[Candidate]:
+    """Returns all candidates for a decision point.
+
+    Args:
+        decision_id: The decision point to query.
+
+    Returns:
+        List of Candidate objects ordered by score descending.
+    """
+    query = _CANDIDATES_FOR_DECISION_QUERY.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        candidates_table=self.config.candidates_table,
+    )
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "decision_id", "STRING", decision_id
+            ),
+        ]
+    )
+    try:
+      job = self.client.query(query, job_config=job_config)
+      rows = list(job.result())
+      return [
+          Candidate(
+              candidate_id=row.get("candidate_id", ""),
+              decision_id=row.get("decision_id", ""),
+              session_id=row.get("session_id", ""),
+              name=row.get("name", ""),
+              score=float(row.get("score", 0.0)),
+              status=row.get("status", ""),
+              rejection_rationale=row.get("rejection_rationale"),
+          )
+          for row in rows
+      ]
+    except Exception as e:
+      logger.warning(
+          "Failed to get candidates for decision %s: %s",
+          decision_id, e,
+      )
+      return []
+
+  def export_audit_trail(
+      self,
+      session_id: str,
+      include_dropped: bool = True,
+  ) -> list[dict[str, Any]]:
+    """Exports a full audit trail for a session's decisions.
+
+    Returns all decision points with their candidates, scores,
+    status, and rejection rationale.
+
+    Args:
+        session_id: Session to export.
+        include_dropped: If False, only returns selected candidates.
+
+    Returns:
+        List of dicts with decision and candidate details.
+    """
+    decision_points = self.get_decision_points_for_session(session_id)
+    trail: list[dict[str, Any]] = []
+
+    for dp in decision_points:
+      candidates = self.get_candidates_for_decision(dp.decision_id)
+      if not include_dropped:
+        candidates = [
+            c for c in candidates if c.status == "SELECTED"
+        ]
+
+      trail.append({
+          "decision_id": dp.decision_id,
+          "decision_type": dp.decision_type,
+          "description": dp.description,
+          "span_id": dp.span_id,
+          "candidates": [
+              {
+                  "candidate_id": c.candidate_id,
+                  "name": c.name,
+                  "score": c.score,
+                  "status": c.status,
+                  "rejection_rationale": c.rejection_rationale,
+              }
+              for c in candidates
+          ],
+      })
+
+    return trail
 
   # -------------------------------------------------------------- #
   # Pipeline: End-to-End                                             #

@@ -22,8 +22,10 @@ from unittest.mock import patch
 import pytest
 
 from bigquery_agent_analytics.context_graph import BizNode
+from bigquery_agent_analytics.context_graph import Candidate
 from bigquery_agent_analytics.context_graph import ContextGraphConfig
 from bigquery_agent_analytics.context_graph import ContextGraphManager
+from bigquery_agent_analytics.context_graph import DecisionPoint
 from bigquery_agent_analytics.context_graph import WorldChangeAlert
 from bigquery_agent_analytics.context_graph import WorldChangeReport
 
@@ -681,6 +683,484 @@ class TestContextGraphManager:
 
     result = mgr.create_cross_links(["sess-1"])
     assert result is True
+
+
+# ------------------------------------------------------------------ #
+# Decision Semantics Data Model Tests                                  #
+# ------------------------------------------------------------------ #
+
+
+class TestDecisionPoint:
+  """Tests for DecisionPoint dataclass."""
+
+  def test_creation(self):
+    dp = DecisionPoint(
+        decision_id="dp-1",
+        session_id="sess-1",
+        span_id="span-5",
+        decision_type="audience_selection",
+        description="Select target audience for Nike campaign",
+    )
+    assert dp.decision_id == "dp-1"
+    assert dp.decision_type == "audience_selection"
+    assert dp.description == "Select target audience for Nike campaign"
+    assert dp.metadata == {}
+
+  def test_defaults(self):
+    dp = DecisionPoint(
+        decision_id="dp-1",
+        session_id="sess-1",
+        span_id="span-1",
+        decision_type="placement",
+    )
+    assert dp.description == ""
+    assert dp.timestamp is None
+    assert dp.metadata == {}
+
+
+class TestCandidate:
+  """Tests for Candidate dataclass."""
+
+  def test_selected_candidate(self):
+    c = Candidate(
+        candidate_id="c-1",
+        decision_id="dp-1",
+        session_id="sess-1",
+        name="Athletes 18-35",
+        score=0.91,
+        status="SELECTED",
+    )
+    assert c.name == "Athletes 18-35"
+    assert c.score == 0.91
+    assert c.status == "SELECTED"
+    assert c.rejection_rationale is None
+
+  def test_dropped_candidate(self):
+    c = Candidate(
+        candidate_id="c-2",
+        decision_id="dp-1",
+        session_id="sess-1",
+        name="Fitness Enthusiasts",
+        score=0.78,
+        status="DROPPED",
+        rejection_rationale="Budget constraint: $50K insufficient for reach",
+    )
+    assert c.status == "DROPPED"
+    assert "Budget constraint" in c.rejection_rationale
+
+  def test_defaults(self):
+    c = Candidate(
+        candidate_id="c-1",
+        decision_id="dp-1",
+        session_id="sess-1",
+        name="Test",
+    )
+    assert c.score == 0.0
+    assert c.status == "SELECTED"
+    assert c.rejection_rationale is None
+    assert c.properties == {}
+
+
+# ------------------------------------------------------------------ #
+# Decision Semantics Manager Tests                                     #
+# ------------------------------------------------------------------ #
+
+
+class TestDecisionSemantics:
+  """Tests for Decision Semantics extension methods."""
+
+  def _make_manager(self, mock_client=None):
+    return ContextGraphManager(
+        project_id="test-project",
+        dataset_id="test_dataset",
+        table_id="agent_events",
+        client=mock_client or MagicMock(),
+    )
+
+  def test_config_has_decision_tables(self):
+    config = ContextGraphConfig()
+    assert config.decision_points_table == "decision_points"
+    assert config.candidates_table == "candidates"
+    assert config.decision_edges_table == "decision_edges"
+
+  def test_config_custom_decision_tables(self):
+    config = ContextGraphConfig(
+        decision_points_table="my_decisions",
+        candidates_table="my_candidates",
+        decision_edges_table="my_edges",
+    )
+    assert config.decision_points_table == "my_decisions"
+    assert config.candidates_table == "my_candidates"
+    assert config.decision_edges_table == "my_edges"
+
+  def test_store_decision_points_empty(self):
+    mgr = self._make_manager()
+    assert mgr.store_decision_points([], []) is True
+
+  def test_store_decision_points_success(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_client.query.return_value = mock_job
+    mock_client.insert_rows_json.return_value = []
+    mgr = self._make_manager(mock_client)
+
+    dps = [
+        DecisionPoint(
+            decision_id="dp-1",
+            session_id="sess-1",
+            span_id="s5",
+            decision_type="audience_selection",
+            description="Select audience",
+        ),
+    ]
+    candidates = [
+        Candidate(
+            candidate_id="c-1",
+            decision_id="dp-1",
+            session_id="sess-1",
+            name="Athletes 18-35",
+            score=0.91,
+            status="SELECTED",
+        ),
+        Candidate(
+            candidate_id="c-2",
+            decision_id="dp-1",
+            session_id="sess-1",
+            name="Fitness Enthusiasts",
+            score=0.78,
+            status="DROPPED",
+            rejection_rationale="Budget constraint",
+        ),
+    ]
+    result = mgr.store_decision_points(dps, candidates)
+    assert result is True
+    # 2 insert_rows_json calls (one for DPs, one for candidates)
+    assert mock_client.insert_rows_json.call_count == 2
+
+  def test_store_decision_points_dp_insert_error(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_client.query.return_value = mock_job
+    mock_client.insert_rows_json.return_value = [
+        {"errors": ["insert failed"]}
+    ]
+    mgr = self._make_manager(mock_client)
+
+    dps = [
+        DecisionPoint(
+            decision_id="dp-1",
+            session_id="sess-1",
+            span_id="s5",
+            decision_type="test",
+        ),
+    ]
+    result = mgr.store_decision_points(dps, [])
+    assert result is False
+
+  def test_store_decision_points_table_create_failure(self):
+    mock_client = MagicMock()
+    mock_client.query.side_effect = Exception("Permission denied")
+    mgr = self._make_manager(mock_client)
+
+    dps = [
+        DecisionPoint(
+            decision_id="dp-1",
+            session_id="sess-1",
+            span_id="s5",
+            decision_type="test",
+        ),
+    ]
+    result = mgr.store_decision_points(dps, [])
+    assert result is False
+
+  def test_create_decision_edges_success(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    result = mgr.create_decision_edges(["sess-1"])
+    assert result is True
+    # 3 table creates + 1 insert
+    assert mock_client.query.call_count == 4
+
+  def test_create_decision_edges_failure(self):
+    mock_client = MagicMock()
+    mock_client.query.side_effect = Exception("BQ error")
+    mgr = self._make_manager(mock_client)
+
+    result = mgr.create_decision_edges(["sess-1"])
+    assert result is False
+
+  def test_get_decision_property_graph_ddl(self):
+    mgr = self._make_manager()
+    ddl = mgr.get_decision_property_graph_ddl()
+    assert "CREATE OR REPLACE PROPERTY GRAPH" in ddl
+    assert "DecisionPoint" in ddl
+    assert "CandidateNode" in ddl
+    assert "DecisionEdge" in ddl
+    assert "decision_type" in ddl
+    assert "rejection_rationale" in ddl
+    assert "test-project" in ddl
+    assert "test_dataset" in ddl
+
+  def test_get_decision_property_graph_ddl_custom_name(self):
+    mgr = self._make_manager()
+    ddl = mgr.get_decision_property_graph_ddl(graph_name="my_graph")
+    assert "my_graph" in ddl
+
+  def test_get_eu_audit_gql(self):
+    mgr = self._make_manager()
+    gql = mgr.get_eu_audit_gql()
+    assert "GRAPH" in gql
+    assert "MATCH" in gql
+    assert "DecisionPoint" in gql
+    assert "CandidateNode" in gql
+    assert "candidate_score" in gql
+    assert "rejection_rationale" in gql
+
+  def test_get_eu_audit_gql_with_decision_type(self):
+    mgr = self._make_manager()
+    gql = mgr.get_eu_audit_gql(decision_type="audience_selection")
+    assert "@decision_type" in gql
+
+  def test_get_dropped_candidates_gql(self):
+    mgr = self._make_manager()
+    gql = mgr.get_dropped_candidates_gql()
+    assert "GRAPH" in gql
+    assert "DROPPED" in gql
+    assert "rejection_rationale" in gql
+    assert "DecisionPoint" in gql
+
+  def test_get_decision_points_for_session(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "span_id": "s5",
+            "decision_type": "audience_selection",
+            "description": "Select audience",
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    dps = mgr.get_decision_points_for_session("sess-1")
+    assert len(dps) == 1
+    assert dps[0].decision_id == "dp-1"
+    assert dps[0].decision_type == "audience_selection"
+
+  def test_get_decision_points_for_session_failure(self):
+    mock_client = MagicMock()
+    mock_client.query.side_effect = Exception("BQ error")
+    mgr = self._make_manager(mock_client)
+
+    dps = mgr.get_decision_points_for_session("sess-1")
+    assert dps == []
+
+  def test_get_candidates_for_decision(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "candidate_id": "c-1",
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "name": "Athletes 18-35",
+            "score": 0.91,
+            "status": "SELECTED",
+            "rejection_rationale": None,
+        },
+        {
+            "candidate_id": "c-2",
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "name": "Fitness Enthusiasts",
+            "score": 0.78,
+            "status": "DROPPED",
+            "rejection_rationale": "Budget constraint",
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    candidates = mgr.get_candidates_for_decision("dp-1")
+    assert len(candidates) == 2
+    assert candidates[0].name == "Athletes 18-35"
+    assert candidates[0].status == "SELECTED"
+    assert candidates[1].status == "DROPPED"
+    assert candidates[1].rejection_rationale == "Budget constraint"
+
+  def test_get_candidates_for_decision_failure(self):
+    mock_client = MagicMock()
+    mock_client.query.side_effect = Exception("BQ error")
+    mgr = self._make_manager(mock_client)
+
+    candidates = mgr.get_candidates_for_decision("dp-1")
+    assert candidates == []
+
+  def test_export_audit_trail(self):
+    mock_client = MagicMock()
+    mock_job_dp = MagicMock()
+    mock_job_dp.result.return_value = [
+        {
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "span_id": "s5",
+            "decision_type": "audience_selection",
+            "description": "Select audience",
+        },
+    ]
+    mock_job_cand = MagicMock()
+    mock_job_cand.result.return_value = [
+        {
+            "candidate_id": "c-1",
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "name": "Athletes 18-35",
+            "score": 0.91,
+            "status": "SELECTED",
+            "rejection_rationale": None,
+        },
+        {
+            "candidate_id": "c-2",
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "name": "Fitness Enthusiasts",
+            "score": 0.78,
+            "status": "DROPPED",
+            "rejection_rationale": "Budget constraint",
+        },
+    ]
+    # First query returns DPs, second returns candidates
+    mock_client.query.side_effect = [mock_job_dp, mock_job_cand]
+    mgr = self._make_manager(mock_client)
+
+    trail = mgr.export_audit_trail("sess-1")
+    assert len(trail) == 1
+    assert trail[0]["decision_type"] == "audience_selection"
+    assert len(trail[0]["candidates"]) == 2
+    assert trail[0]["candidates"][0]["name"] == "Athletes 18-35"
+    assert trail[0]["candidates"][1]["rejection_rationale"] == (
+        "Budget constraint"
+    )
+
+  def test_export_audit_trail_exclude_dropped(self):
+    mock_client = MagicMock()
+    mock_job_dp = MagicMock()
+    mock_job_dp.result.return_value = [
+        {
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "span_id": "s5",
+            "decision_type": "audience_selection",
+            "description": "Select audience",
+        },
+    ]
+    mock_job_cand = MagicMock()
+    mock_job_cand.result.return_value = [
+        {
+            "candidate_id": "c-1",
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "name": "Athletes 18-35",
+            "score": 0.91,
+            "status": "SELECTED",
+            "rejection_rationale": None,
+        },
+        {
+            "candidate_id": "c-2",
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "name": "Fitness Enthusiasts",
+            "score": 0.78,
+            "status": "DROPPED",
+            "rejection_rationale": "Budget constraint",
+        },
+    ]
+    mock_client.query.side_effect = [mock_job_dp, mock_job_cand]
+    mgr = self._make_manager(mock_client)
+
+    trail = mgr.export_audit_trail("sess-1", include_dropped=False)
+    assert len(trail) == 1
+    assert len(trail[0]["candidates"]) == 1
+    assert trail[0]["candidates"][0]["status"] == "SELECTED"
+
+  def test_decision_output_schema_has_required_fields(self):
+    from bigquery_agent_analytics.context_graph import (
+        _DECISION_POINT_OUTPUT_SCHEMA,
+    )
+    assert "decision_type" in _DECISION_POINT_OUTPUT_SCHEMA
+    assert "candidates" in _DECISION_POINT_OUTPUT_SCHEMA
+    assert "score" in _DECISION_POINT_OUTPUT_SCHEMA
+    assert "status" in _DECISION_POINT_OUTPUT_SCHEMA
+    assert "rejection_rationale" in _DECISION_POINT_OUTPUT_SCHEMA
+
+  def test_decision_property_graph_ddl_includes_base_pillars(self):
+    """Decision DDL still includes TechNode, BizNode, Caused, Evaluated."""
+    mgr = self._make_manager()
+    ddl = mgr.get_decision_property_graph_ddl()
+    assert "TechNode" in ddl
+    assert "BizNode" in ddl
+    assert "Caused" in ddl
+    assert "Evaluated" in ddl
+
+  def test_extract_decision_points_returns_empty_for_client_side(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = []
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    dps, cands = mgr.extract_decision_points(["sess-1"])
+    assert dps == []
+    assert cands == []
+
+  def test_extract_decision_points_failure(self):
+    mock_client = MagicMock()
+    mock_client.query.side_effect = Exception("BQ error")
+    mgr = self._make_manager(mock_client)
+
+    dps, cands = mgr.extract_decision_points(["sess-1"])
+    assert dps == []
+    assert cands == []
+
+  def test_store_candidates_insert_error(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_client.query.return_value = mock_job
+    call_count = {"n": 0}
+
+    def insert_side_effect(table, rows):
+      call_count["n"] += 1
+      if call_count["n"] == 2:
+        return [{"errors": ["insert failed"]}]
+      return []
+
+    mock_client.insert_rows_json.side_effect = insert_side_effect
+    mgr = self._make_manager(mock_client)
+
+    dps = [
+        DecisionPoint(
+            decision_id="dp-1",
+            session_id="sess-1",
+            span_id="s5",
+            decision_type="test",
+        ),
+    ]
+    candidates = [
+        Candidate(
+            candidate_id="c-1",
+            decision_id="dp-1",
+            session_id="sess-1",
+            name="Test",
+            score=0.5,
+        ),
+    ]
+    result = mgr.store_decision_points(dps, candidates)
+    assert result is False
 
 
 # ------------------------------------------------------------------ #
