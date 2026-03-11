@@ -515,6 +515,47 @@ WHERE base.session_id IN UNNEST(@session_ids)
 ORDER BY base.timestamp ASC
 """
 
+_EXTRACT_DECISION_POINTS_AI_QUERY = """\
+SELECT
+  base.span_id,
+  base.session_id,
+  REGEXP_REPLACE(
+    REGEXP_REPLACE(
+      AI.GENERATE(
+        CONCAT(
+          'Identify decision points in this agent payload. ',
+          'A decision point is where the agent evaluated multiple ',
+          'candidates and selected or rejected them. ',
+          'For each decision, return the decision_type, description, ',
+          'and all candidates with name, score (0-1), status ',
+          '(SELECTED or DROPPED), and rejection_rationale ',
+          '(null if selected, required reason if dropped).',
+          '\\n\\nPayload:\\n',
+          COALESCE(
+            JSON_EXTRACT_SCALAR(base.content, '$.text_summary'),
+            JSON_EXTRACT_SCALAR(base.content, '$.response'),
+            JSON_EXTRACT_SCALAR(base.content, '$.text'),
+            TO_JSON_STRING(base.content)
+          )
+        ),
+        endpoint => '{endpoint}',
+        output_schema => '{output_schema}'
+      ).result,
+      r'^```(?:json)?\\s*', ''),
+    r'\\s*```$', '')
+  AS decisions_json
+FROM `{project}.{dataset}.{table}` AS base
+WHERE base.session_id IN UNNEST(@session_ids)
+  AND base.event_type IN (
+    'LLM_RESPONSE',
+    'TOOL_COMPLETED',
+    'AGENT_COMPLETED',
+    'HITL_CONFIRMATION_REQUEST_COMPLETED'
+  )
+  AND base.content IS NOT NULL
+ORDER BY base.timestamp ASC
+"""
+
 _DELETE_DECISION_POINTS_FOR_SESSIONS_QUERY = """\
 DELETE FROM `{project}.{dataset}.{decision_points_table}`
 WHERE session_id IN UNNEST(@session_ids)
@@ -1382,29 +1423,116 @@ class ContextGraphManager:
   ) -> list[dict[str, Any]]:
     """Traverses the context graph to explain a decision.
 
-    Answers "Why was X selected?" by following causal chains
-    from a decision back to the business inputs.
+    When *session_id* is provided, uses the EU audit GQL query
+    that traverses TechNode→MadeDecision→DecisionPoint→CandidateEdge
+    →CandidateNode, returning all candidates with scores, status,
+    and rejection rationale.  The *decision_type* and
+    *include_dropped* parameters filter the results.
 
-    When *session_id* is provided and decision tables exist, this
-    also includes Decision Semantics data (candidates, scores,
-    rejection rationale).  Set *include_dropped=True* to include
-    dropped candidates in the results.
+    When *session_id* is not provided, falls back to the original
+    BizNode reasoning-chain query.
 
     Args:
-        decision_event_type: The terminal decision event type.
-        biz_entity: Optional specific entity to explain.
-        session_id: Optional session to include decision data for.
-        decision_type: Optional filter for decision type.
+        decision_event_type: The terminal decision event type
+            (used only in BizNode fallback path).
+        biz_entity: Optional specific entity to explain
+            (used only in BizNode fallback path).
+        session_id: Session to query decision data for.
+            When provided, uses the EU audit GQL path.
+        decision_type: Optional filter for decision type
+            (e.g. "audience_selection").
         include_dropped: Include dropped candidates in results.
         graph_name: Override graph name.
         max_hops: Override max causal hops.
         result_limit: Maximum results.
 
     Returns:
-        List of reasoning chain steps as dicts.  When decision
-        data is included, each dict may contain a
-        ``decision_candidates`` key with the audit trail.
+        List of dicts with decision and candidate details.
     """
+    # Decision Semantics path: use EU audit GQL
+    if session_id:
+      return self._explain_decision_via_audit(
+          session_id=session_id,
+          decision_type=decision_type,
+          include_dropped=include_dropped,
+          graph_name=graph_name,
+          max_hops=max_hops,
+          result_limit=result_limit,
+      )
+
+    # BizNode fallback path: original reasoning chain
+    return self._explain_decision_via_reasoning_chain(
+        decision_event_type=decision_event_type,
+        biz_entity=biz_entity,
+        graph_name=graph_name,
+        max_hops=max_hops,
+        result_limit=result_limit,
+    )
+
+  def _explain_decision_via_audit(
+      self,
+      session_id: str,
+      decision_type: Optional[str] = None,
+      include_dropped: bool = False,
+      graph_name: Optional[str] = None,
+      max_hops: Optional[int] = None,
+      result_limit: int = 100,
+  ) -> list[dict[str, Any]]:
+    """Explains decisions using the EU audit GQL path."""
+    query = self.get_eu_audit_gql(
+        session_id=session_id,
+        decision_type=decision_type,
+        graph_name=graph_name,
+        max_hops=max_hops,
+        result_limit=result_limit,
+    )
+
+    params = [
+        bigquery.ScalarQueryParameter(
+            "session_id", "STRING", session_id
+        ),
+        bigquery.ScalarQueryParameter(
+            "result_limit", "INT64", result_limit
+        ),
+    ]
+    if decision_type:
+      params.append(
+          bigquery.ScalarQueryParameter(
+              "decision_type", "STRING", decision_type
+          )
+      )
+
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+
+    try:
+      job = self.client.query(query, job_config=job_config)
+      rows = list(job.result())
+      results = [dict(row) for row in rows]
+    except Exception as e:
+      logger.warning("EU audit GQL query failed: %s", e)
+      # Fall back to export_audit_trail for non-graph path
+      return self.export_audit_trail(
+          session_id,
+          include_dropped=include_dropped,
+      )
+
+    if not include_dropped:
+      results = [
+          r for r in results
+          if r.get("candidate_status") != "DROPPED"
+      ]
+
+    return results
+
+  def _explain_decision_via_reasoning_chain(
+      self,
+      decision_event_type: str,
+      biz_entity: Optional[str] = None,
+      graph_name: Optional[str] = None,
+      max_hops: Optional[int] = None,
+      result_limit: int = 100,
+  ) -> list[dict[str, Any]]:
+    """Explains decisions using the BizNode reasoning chain."""
     query = self.get_reasoning_chain_gql(
         decision_event_type=decision_event_type,
         biz_entity=biz_entity,
@@ -1433,25 +1561,10 @@ class ContextGraphManager:
     try:
       job = self.client.query(query, job_config=job_config)
       rows = list(job.result())
-      results = [dict(row) for row in rows]
+      return [dict(row) for row in rows]
     except Exception as e:
       logger.warning("GQL reasoning chain query failed: %s", e)
-      results = []
-
-    # Enrich with decision semantics if session_id provided
-    if session_id:
-      try:
-        trail = self.export_audit_trail(
-            session_id,
-            include_dropped=include_dropped,
-        )
-        if trail:
-          for r in results:
-            r["decision_candidates"] = trail
-      except Exception as e:
-        logger.debug("Decision enrichment skipped: %s", e)
-
-    return results
+      return []
 
   def get_causal_chain_gql(
       self,
@@ -1796,13 +1909,13 @@ class ContextGraphManager:
   ) -> tuple[list[DecisionPoint], list[Candidate]]:
     """Extracts decision points and candidates from agent traces.
 
-    When *use_ai_generate* is True, uses BigQuery AI.GENERATE_TEXT
+    When *use_ai_generate* is True, uses BigQuery AI.GENERATE
     with ``_DECISION_POINT_OUTPUT_SCHEMA`` to extract structured
-    decision data server-side.  When False, fetches payloads for
-    client-side extraction.
+    decision data server-side, including candidates with scores,
+    selection status, and rejection rationale.
 
-    Extracted results are automatically stored via
-    ``store_decision_points``.
+    When False, fetches payloads for client-side extraction;
+    each payload becomes a DecisionPoint stub with no candidates.
 
     Args:
         session_ids: Sessions to extract decision points from.
@@ -1811,6 +1924,102 @@ class ContextGraphManager:
     Returns:
         A tuple of (decision_points, candidates) lists.
     """
+    if use_ai_generate:
+      return self._extract_decisions_via_ai_generate(session_ids)
+    return self._extract_decisions_for_client(session_ids)
+
+  def _extract_decisions_via_ai_generate(
+      self, session_ids: list[str]
+  ) -> tuple[list[DecisionPoint], list[Candidate]]:
+    """Server-side extraction using AI.GENERATE with output_schema."""
+    import json as _json
+
+    query = _EXTRACT_DECISION_POINTS_AI_QUERY.format(
+        project=self.project_id,
+        dataset=self.dataset_id,
+        table=self.table_id,
+        endpoint=self._resolve_endpoint(),
+        output_schema=_DECISION_POINT_OUTPUT_SCHEMA,
+    )
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "session_ids", "STRING", session_ids
+            ),
+        ]
+    )
+
+    try:
+      job = self.client.query(query, job_config=job_config)
+      rows = list(job.result())
+    except Exception as e:
+      logger.warning(
+          "AI.GENERATE decision extraction failed: %s", e
+      )
+      return [], []
+
+    all_dps: list[DecisionPoint] = []
+    all_candidates: list[Candidate] = []
+
+    for row in rows:
+      span_id = row.get("span_id", "")
+      session_id = row.get("session_id", "")
+      raw_json = row.get("decisions_json", "")
+
+      if not raw_json:
+        continue
+
+      try:
+        decisions = _json.loads(raw_json)
+      except (_json.JSONDecodeError, TypeError):
+        logger.debug(
+            "Could not parse decisions JSON for span %s", span_id
+        )
+        continue
+
+      if not isinstance(decisions, list):
+        decisions = [decisions]
+
+      for idx, dec in enumerate(decisions):
+        decision_id = f"{session_id}:dp:{span_id}:{idx}"
+        dp = DecisionPoint(
+            decision_id=decision_id,
+            session_id=session_id,
+            span_id=span_id,
+            decision_type=dec.get("decision_type", "unknown"),
+            description=dec.get("description", ""),
+        )
+        all_dps.append(dp)
+
+        for cidx, cand in enumerate(
+            dec.get("candidates", [])
+        ):
+          candidate_id = f"{decision_id}:c:{cidx}"
+          status = cand.get("status", "SELECTED").upper()
+          c = Candidate(
+              candidate_id=candidate_id,
+              decision_id=decision_id,
+              session_id=session_id,
+              name=cand.get("name", ""),
+              score=float(cand.get("score", 0.0)),
+              status=status,
+              rejection_rationale=cand.get(
+                  "rejection_rationale"
+              ),
+          )
+          all_candidates.append(c)
+
+    logger.info(
+        "AI.GENERATE extracted %d decision points, %d candidates",
+        len(all_dps), len(all_candidates),
+    )
+    return all_dps, all_candidates
+
+  def _extract_decisions_for_client(
+      self, session_ids: list[str]
+  ) -> tuple[list[DecisionPoint], list[Candidate]]:
+    """Fetches payloads for client-side decision extraction."""
     query = _EXTRACT_DECISION_POINTS_QUERY.format(
         project=self.project_id,
         dataset=self.dataset_id,
@@ -1828,37 +2037,28 @@ class ContextGraphManager:
     try:
       job = self.client.query(query, job_config=job_config)
       rows = list(job.result())
-      logger.info(
-          "Fetched %d candidate payloads for decision extraction",
-          len(rows),
-      )
     except Exception as e:
       logger.warning("Decision point extraction failed: %s", e)
       return [], []
 
     all_dps: list[DecisionPoint] = []
-    all_candidates: list[Candidate] = []
-
     for row in rows:
       span_id = row.get("span_id", "")
       session_id = row.get("session_id", "")
       payload = row.get("payload_text", "")
-
       if not payload:
         continue
-
       dp_idx = len(all_dps)
       decision_id = f"{session_id}:dp:{span_id}:{dp_idx}"
-      dp = DecisionPoint(
+      all_dps.append(DecisionPoint(
           decision_id=decision_id,
           session_id=session_id,
           span_id=span_id,
-          decision_type="extracted",
+          decision_type="raw_payload",
           description=payload[:200],
-      )
-      all_dps.append(dp)
+      ))
 
-    return all_dps, all_candidates
+    return all_dps, []
 
   def store_decision_points(
       self,

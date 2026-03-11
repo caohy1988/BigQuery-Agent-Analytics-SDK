@@ -1125,7 +1125,8 @@ class TestDecisionSemantics:
     assert dps == []
     assert cands == []
 
-  def test_extract_decision_points_returns_dps_from_rows(self):
+  def test_extract_decision_points_client_path_returns_stubs(self):
+    """use_ai_generate=False returns raw_payload stubs, no candidates."""
     mock_client = MagicMock()
     mock_job = MagicMock()
     mock_job.result.return_value = [
@@ -1145,13 +1146,107 @@ class TestDecisionSemantics:
     mock_client.query.return_value = mock_job
     mgr = self._make_manager(mock_client)
 
-    dps, cands = mgr.extract_decision_points(["sess-1"])
+    dps, cands = mgr.extract_decision_points(
+        ["sess-1"], use_ai_generate=False,
+    )
     assert len(dps) == 2
     assert dps[0].span_id == "s5"
     assert dps[0].session_id == "sess-1"
-    assert dps[0].decision_type == "extracted"
+    assert dps[0].decision_type == "raw_payload"
     assert dps[1].span_id == "s8"
-    # Candidates remain empty (client-side extraction needed)
+    assert cands == []
+
+  def test_extract_decision_points_ai_generate_parses_json(self):
+    """AI.GENERATE path parses JSON into DecisionPoints + Candidates."""
+    import json
+
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "span_id": "s5",
+            "session_id": "sess-1",
+            "decisions_json": json.dumps([
+                {
+                    "decision_type": "audience_selection",
+                    "description": "Select target audience",
+                    "candidates": [
+                        {
+                            "name": "Athletes 18-35",
+                            "score": 0.91,
+                            "status": "SELECTED",
+                            "rejection_rationale": None,
+                        },
+                        {
+                            "name": "Fitness Enthusiasts",
+                            "score": 0.78,
+                            "status": "DROPPED",
+                            "rejection_rationale": "Lower engagement",
+                        },
+                    ],
+                },
+            ]),
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    dps, cands = mgr.extract_decision_points(
+        ["sess-1"], use_ai_generate=True,
+    )
+    assert len(dps) == 1
+    assert dps[0].decision_type == "audience_selection"
+    assert dps[0].description == "Select target audience"
+    assert dps[0].span_id == "s5"
+    assert dps[0].session_id == "sess-1"
+
+    assert len(cands) == 2
+    assert cands[0].name == "Athletes 18-35"
+    assert cands[0].score == 0.91
+    assert cands[0].status == "SELECTED"
+    assert cands[0].rejection_rationale is None
+    assert cands[1].name == "Fitness Enthusiasts"
+    assert cands[1].status == "DROPPED"
+    assert cands[1].rejection_rationale == "Lower engagement"
+
+  def test_extract_decision_points_ai_generate_bad_json(self):
+    """AI.GENERATE path skips rows with unparseable JSON."""
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "span_id": "s5",
+            "session_id": "sess-1",
+            "decisions_json": "not valid json {{{",
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    dps, cands = mgr.extract_decision_points(
+        ["sess-1"], use_ai_generate=True,
+    )
+    assert dps == []
+    assert cands == []
+
+  def test_extract_decision_points_ai_generate_empty_json(self):
+    """AI.GENERATE path skips rows with empty decisions_json."""
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "span_id": "s5",
+            "session_id": "sess-1",
+            "decisions_json": "",
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    dps, cands = mgr.extract_decision_points(
+        ["sess-1"], use_ai_generate=True,
+    )
+    assert dps == []
     assert cands == []
 
   def test_extract_decision_points_failure(self):
@@ -1222,15 +1317,116 @@ class TestDecisionSemantics:
     sql = mock_client.query.call_args[0][0]
     assert "DecisionPoint" not in sql
 
-  def test_explain_decision_with_session_and_include_dropped(self):
+  def test_explain_decision_audit_path_includes_all(self):
+    """session_id triggers EU audit GQL path, include_dropped=True."""
     mock_client = MagicMock()
-    # explain_decision calls get_reasoning_chain_gql → query,
-    # then export_audit_trail → get_decision_points → query,
-    # then get_candidates_for_decision → query
-    mock_job_gql = MagicMock()
-    mock_job_gql.result.return_value = [
-        {"decision_span_id": "s1", "entity_value": "Nike"},
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "decision_id": "dp-1",
+            "decision_type": "audience",
+            "decision_description": "test",
+            "candidate_name": "Athletes",
+            "candidate_score": 0.91,
+            "candidate_status": "SELECTED",
+            "rejection_rationale": None,
+            "edge_type": "SELECTED_CANDIDATE",
+            "span_id": "s5",
+            "event_type": "LLM_RESPONSE",
+            "agent": "root",
+        },
+        {
+            "decision_id": "dp-1",
+            "decision_type": "audience",
+            "decision_description": "test",
+            "candidate_name": "Fitness",
+            "candidate_score": 0.78,
+            "candidate_status": "DROPPED",
+            "rejection_rationale": "Budget",
+            "edge_type": "DROPPED_CANDIDATE",
+            "span_id": "s5",
+            "event_type": "LLM_RESPONSE",
+            "agent": "root",
+        },
     ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    results = mgr.explain_decision(
+        session_id="sess-1",
+        include_dropped=True,
+    )
+    assert len(results) == 2
+    assert results[0]["candidate_name"] == "Athletes"
+    assert results[1]["candidate_name"] == "Fitness"
+    assert results[1]["candidate_status"] == "DROPPED"
+
+  def test_explain_decision_audit_path_filters_dropped(self):
+    """include_dropped=False filters out DROPPED candidates."""
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "decision_id": "dp-1",
+            "decision_type": "audience",
+            "candidate_name": "Athletes",
+            "candidate_score": 0.91,
+            "candidate_status": "SELECTED",
+            "rejection_rationale": None,
+        },
+        {
+            "decision_id": "dp-1",
+            "decision_type": "audience",
+            "candidate_name": "Fitness",
+            "candidate_score": 0.78,
+            "candidate_status": "DROPPED",
+            "rejection_rationale": "Budget",
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    results = mgr.explain_decision(
+        session_id="sess-1",
+        include_dropped=False,
+    )
+    assert len(results) == 1
+    assert results[0]["candidate_name"] == "Athletes"
+
+  def test_explain_decision_audit_with_decision_type(self):
+    """decision_type filter is passed to EU audit GQL."""
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "decision_id": "dp-1",
+            "decision_type": "audience_selection",
+            "candidate_name": "Athletes",
+            "candidate_score": 0.91,
+            "candidate_status": "SELECTED",
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    results = mgr.explain_decision(
+        session_id="sess-1",
+        decision_type="audience_selection",
+    )
+    assert len(results) == 1
+    # Verify the query includes the decision_type parameter
+    call_args = mock_client.query.call_args
+    job_config = call_args[1].get("job_config") or call_args[0][1]
+    param_names = [p.name for p in job_config.query_parameters]
+    assert "decision_type" in param_names
+
+  def test_explain_decision_audit_fallback_on_gql_error(self):
+    """EU audit GQL failure falls back to export_audit_trail."""
+    mock_client = MagicMock()
+    # First call (EU audit GQL) fails
+    mock_job_fail = MagicMock()
+    mock_job_fail.result.side_effect = Exception("GQL not available")
+    # Fallback: export_audit_trail calls get_decision_points + get_candidates
     mock_job_dp = MagicMock()
     mock_job_dp.result.return_value = [
         {
@@ -1252,18 +1448,9 @@ class TestDecisionSemantics:
             "status": "SELECTED",
             "rejection_rationale": None,
         },
-        {
-            "candidate_id": "c-2",
-            "decision_id": "dp-1",
-            "session_id": "sess-1",
-            "name": "Fitness",
-            "score": 0.78,
-            "status": "DROPPED",
-            "rejection_rationale": "Budget",
-        },
     ]
     mock_client.query.side_effect = [
-        mock_job_gql, mock_job_dp, mock_job_cand,
+        mock_job_fail, mock_job_dp, mock_job_cand,
     ]
     mgr = self._make_manager(mock_client)
 
@@ -1271,11 +1458,29 @@ class TestDecisionSemantics:
         session_id="sess-1",
         include_dropped=True,
     )
+    # Falls back to export_audit_trail format
     assert len(results) == 1
-    assert "decision_candidates" in results[0]
-    trail = results[0]["decision_candidates"]
-    assert len(trail) == 1
-    assert len(trail[0]["candidates"]) == 2
+    assert results[0]["decision_type"] == "audience"
+
+  def test_explain_decision_reasoning_chain_fallback(self):
+    """No session_id triggers old BizNode reasoning chain path."""
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "decision_span_id": "s1",
+            "entity_value": "Nike",
+            "entity_type": "Product",
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    results = mgr.explain_decision(
+        biz_entity="Nike",
+    )
+    assert len(results) == 1
+    assert results[0]["entity_value"] == "Nike"
 
   def test_build_context_graph_with_decisions(self):
     mock_client = MagicMock()
