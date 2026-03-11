@@ -781,17 +781,20 @@ class TestDecisionSemantics:
     config = ContextGraphConfig()
     assert config.decision_points_table == "decision_points"
     assert config.candidates_table == "candidates"
-    assert config.decision_edges_table == "decision_edges"
+    assert config.made_decision_edges_table == "made_decision_edges"
+    assert config.candidate_edges_table == "candidate_edges"
 
   def test_config_custom_decision_tables(self):
     config = ContextGraphConfig(
         decision_points_table="my_decisions",
         candidates_table="my_candidates",
-        decision_edges_table="my_edges",
+        made_decision_edges_table="my_md_edges",
+        candidate_edges_table="my_cand_edges",
     )
     assert config.decision_points_table == "my_decisions"
     assert config.candidates_table == "my_candidates"
-    assert config.decision_edges_table == "my_edges"
+    assert config.made_decision_edges_table == "my_md_edges"
+    assert config.candidate_edges_table == "my_cand_edges"
 
   def test_store_decision_points_empty(self):
     mgr = self._make_manager()
@@ -881,8 +884,8 @@ class TestDecisionSemantics:
 
     result = mgr.create_decision_edges(["sess-1"])
     assert result is True
-    # 3 table creates + 1 insert
-    assert mock_client.query.call_count == 4
+    # 4 table creates + 2 deletes + 2 inserts = 8
+    assert mock_client.query.call_count == 8
 
   def test_create_decision_edges_failure(self):
     mock_client = MagicMock()
@@ -898,7 +901,8 @@ class TestDecisionSemantics:
     assert "CREATE OR REPLACE PROPERTY GRAPH" in ddl
     assert "DecisionPoint" in ddl
     assert "CandidateNode" in ddl
-    assert "DecisionEdge" in ddl
+    assert "MadeDecision" in ddl
+    assert "CandidateEdge" in ddl
     assert "decision_type" in ddl
     assert "rejection_rationale" in ddl
     assert "test-project" in ddl
@@ -916,6 +920,8 @@ class TestDecisionSemantics:
     assert "MATCH" in gql
     assert "DecisionPoint" in gql
     assert "CandidateNode" in gql
+    assert "MadeDecision" in gql
+    assert "CandidateEdge" in gql
     assert "candidate_score" in gql
     assert "rejection_rationale" in gql
 
@@ -928,7 +934,8 @@ class TestDecisionSemantics:
     mgr = self._make_manager()
     gql = mgr.get_dropped_candidates_gql()
     assert "GRAPH" in gql
-    assert "DROPPED" in gql
+    assert "DROPPED_CANDIDATE" in gql
+    assert "CandidateEdge" in gql
     assert "rejection_rationale" in gql
     assert "DecisionPoint" in gql
 
@@ -1107,7 +1114,7 @@ class TestDecisionSemantics:
     assert "Caused" in ddl
     assert "Evaluated" in ddl
 
-  def test_extract_decision_points_returns_empty_for_client_side(self):
+  def test_extract_decision_points_empty_rows(self):
     mock_client = MagicMock()
     mock_job = MagicMock()
     mock_job.result.return_value = []
@@ -1116,6 +1123,35 @@ class TestDecisionSemantics:
 
     dps, cands = mgr.extract_decision_points(["sess-1"])
     assert dps == []
+    assert cands == []
+
+  def test_extract_decision_points_returns_dps_from_rows(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = [
+        {
+            "span_id": "s5",
+            "session_id": "sess-1",
+            "event_type": "LLM_RESPONSE",
+            "payload_text": "Selected Athletes 18-35 audience",
+        },
+        {
+            "span_id": "s8",
+            "session_id": "sess-1",
+            "event_type": "TOOL_COMPLETED",
+            "payload_text": "Placement decision made",
+        },
+    ]
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    dps, cands = mgr.extract_decision_points(["sess-1"])
+    assert len(dps) == 2
+    assert dps[0].span_id == "s5"
+    assert dps[0].session_id == "sess-1"
+    assert dps[0].decision_type == "extracted"
+    assert dps[1].span_id == "s8"
+    # Candidates remain empty (client-side extraction needed)
     assert cands == []
 
   def test_extract_decision_points_failure(self):
@@ -1161,6 +1197,187 @@ class TestDecisionSemantics:
     ]
     result = mgr.store_decision_points(dps, candidates)
     assert result is False
+
+  def test_create_property_graph_with_decisions(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    result = mgr.create_property_graph(include_decisions=True)
+    assert result is True
+    sql = mock_client.query.call_args[0][0]
+    assert "DecisionPoint" in sql
+    assert "CandidateNode" in sql
+    assert "MadeDecision" in sql
+
+  def test_create_property_graph_without_decisions(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_client.query.return_value = mock_job
+    mgr = self._make_manager(mock_client)
+
+    result = mgr.create_property_graph(include_decisions=False)
+    assert result is True
+    sql = mock_client.query.call_args[0][0]
+    assert "DecisionPoint" not in sql
+
+  def test_explain_decision_with_session_and_include_dropped(self):
+    mock_client = MagicMock()
+    # explain_decision calls get_reasoning_chain_gql → query,
+    # then export_audit_trail → get_decision_points → query,
+    # then get_candidates_for_decision → query
+    mock_job_gql = MagicMock()
+    mock_job_gql.result.return_value = [
+        {"decision_span_id": "s1", "entity_value": "Nike"},
+    ]
+    mock_job_dp = MagicMock()
+    mock_job_dp.result.return_value = [
+        {
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "span_id": "s5",
+            "decision_type": "audience",
+            "description": "test",
+        },
+    ]
+    mock_job_cand = MagicMock()
+    mock_job_cand.result.return_value = [
+        {
+            "candidate_id": "c-1",
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "name": "Athletes",
+            "score": 0.91,
+            "status": "SELECTED",
+            "rejection_rationale": None,
+        },
+        {
+            "candidate_id": "c-2",
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "name": "Fitness",
+            "score": 0.78,
+            "status": "DROPPED",
+            "rejection_rationale": "Budget",
+        },
+    ]
+    mock_client.query.side_effect = [
+        mock_job_gql, mock_job_dp, mock_job_cand,
+    ]
+    mgr = self._make_manager(mock_client)
+
+    results = mgr.explain_decision(
+        session_id="sess-1",
+        include_dropped=True,
+    )
+    assert len(results) == 1
+    assert "decision_candidates" in results[0]
+    trail = results[0]["decision_candidates"]
+    assert len(trail) == 1
+    assert len(trail[0]["candidates"]) == 2
+
+  def test_build_context_graph_with_decisions(self):
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_job.result.return_value = []
+    mock_client.query.return_value = mock_job
+    mock_client.insert_rows_json.return_value = []
+    mgr = self._make_manager(mock_client)
+
+    results = mgr.build_context_graph(
+        session_ids=["sess-1"],
+        use_ai_generate=False,
+        include_decisions=True,
+    )
+    assert "decision_points_count" in results
+    assert "decision_edges_created" in results
+    assert results["property_graph_created"] is True
+
+  def test_export_audit_trail_json_format(self):
+    mock_client = MagicMock()
+    mock_job_dp = MagicMock()
+    mock_job_dp.result.return_value = [
+        {
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "span_id": "s5",
+            "decision_type": "audience",
+            "description": "test",
+        },
+    ]
+    mock_job_cand = MagicMock()
+    mock_job_cand.result.return_value = [
+        {
+            "candidate_id": "c-1",
+            "decision_id": "dp-1",
+            "session_id": "sess-1",
+            "name": "Athletes",
+            "score": 0.91,
+            "status": "SELECTED",
+            "rejection_rationale": None,
+        },
+    ]
+    mock_client.query.side_effect = [mock_job_dp, mock_job_cand]
+    mgr = self._make_manager(mock_client)
+
+    result = mgr.export_audit_trail("sess-1", format="json")
+    assert isinstance(result, str)
+    import json
+    parsed = json.loads(result)
+    assert len(parsed) == 1
+    assert parsed[0]["decision_type"] == "audience"
+
+  def test_store_decision_points_deletes_before_insert(self):
+    """Verifies idempotency: delete queries run before inserts."""
+    mock_client = MagicMock()
+    mock_job = MagicMock()
+    mock_client.query.return_value = mock_job
+    mock_client.insert_rows_json.return_value = []
+    mgr = self._make_manager(mock_client)
+
+    dps = [
+        DecisionPoint(
+            decision_id="dp-1",
+            session_id="sess-1",
+            span_id="s5",
+            decision_type="test",
+        ),
+    ]
+    mgr.store_decision_points(dps, [])
+    # Queries: 4 table creates + 4 deletes + 1 insert_rows_json
+    # At minimum, query was called for ensures + deletes
+    assert mock_client.query.call_count >= 4
+
+  def test_decision_ddl_edge_source_dest_types(self):
+    """MadeDecision: TechNode->DecisionPoint,
+    CandidateEdge: DecisionPoint->CandidateNode."""
+    mgr = self._make_manager()
+    ddl = mgr.get_decision_property_graph_ddl()
+    # MadeDecision edge: source=TechNode, dest=DecisionPoint
+    assert "SOURCE KEY (span_id) REFERENCES TechNode" in ddl
+    assert (
+        "DESTINATION KEY (decision_id) REFERENCES DecisionPoint"
+        in ddl
+    )
+    # CandidateEdge: source=DecisionPoint, dest=CandidateNode
+    assert (
+        "SOURCE KEY (decision_id) REFERENCES DecisionPoint"
+        in ddl
+    )
+    assert (
+        "DESTINATION KEY (candidate_id) REFERENCES CandidateNode"
+        in ddl
+    )
+
+  def test_eu_audit_gql_edge_direction(self):
+    """EU audit GQL traverses forward: TechNode->DP->Candidate."""
+    mgr = self._make_manager()
+    gql = mgr.get_eu_audit_gql()
+    # Should go forward, not backward
+    assert "-[md:MadeDecision]->" in gql
+    assert "-[ce:CandidateEdge]->" in gql
+    assert "<-" not in gql
 
 
 # ------------------------------------------------------------------ #

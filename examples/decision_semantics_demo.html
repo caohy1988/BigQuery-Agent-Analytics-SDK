@@ -226,40 +226,39 @@ WHEN NOT MATCHED BY TARGET THEN
     name: 'Decision & Candidate Tables DDL',
     category: 'Schema',
     sql: `-- Table 1: DecisionPoint nodes
-CREATE TABLE IF NOT EXISTS \`project.dataset.decision_nodes\` (
-  decision_id STRING NOT NULL,    -- Primary key: "dp-{span_id}"
-  span_id STRING NOT NULL,         -- Links to TechNode that made the decision
-  session_id STRING NOT NULL,
+CREATE TABLE IF NOT EXISTS \`project.dataset.decision_points\` (
+  decision_id STRING,              -- Primary key
+  session_id STRING,
+  span_id STRING,                  -- Links to TechNode that made the decision
   decision_type STRING,            -- e.g. "audience_selection", "placement_selection"
-  rationale STRING                 -- Overall decision rationale
+  description STRING               -- Decision description
 );
 
--- Table 2: Candidate nodes (entities considered during decision)
-CREATE TABLE IF NOT EXISTS \`project.dataset.candidate_nodes\` (
-  candidate_id STRING NOT NULL,    -- Primary key: "{decision_id}:{candidate_value}"
-  decision_id STRING NOT NULL,     -- Links to DecisionPoint
-  candidate_value STRING NOT NULL, -- The entity value (e.g. "Athletes 18-35")
-  candidate_type STRING,           -- Maps to BizNode type (e.g. "Audience")
-  score FLOAT64,                   -- Score / confidence ratio
-  is_selected BOOL NOT NULL,       -- True = selected, False = dropped
-  rejection_reason STRING          -- NULL if selected; rationale if dropped
+-- Table 2: Candidate nodes
+CREATE TABLE IF NOT EXISTS \`project.dataset.candidates\` (
+  candidate_id STRING,             -- Primary key
+  decision_id STRING,              -- Links to DecisionPoint
+  session_id STRING,
+  name STRING,                     -- Candidate name (e.g. "Athletes 18-35")
+  score FLOAT64,                   -- Evaluation score (0.0-1.0)
+  status STRING,                   -- "SELECTED" or "DROPPED"
+  rejection_rationale STRING       -- EU audit: why was this candidate dropped?
 );
 
--- Table 3: Span -> Decision edges
-CREATE TABLE IF NOT EXISTS \`project.dataset.edges_span_to_decision\` (
-  edge_id STRING NOT NULL,
-  span_id STRING NOT NULL,         -- Source: TechNode
-  decision_id STRING NOT NULL,     -- Destination: DecisionPoint
+-- Table 3: MadeDecision edges (TechNode -> DecisionPoint)
+CREATE TABLE IF NOT EXISTS \`project.dataset.made_decision_edges\` (
+  edge_id STRING,
+  span_id STRING,                  -- Source: TechNode
+  decision_id STRING,              -- Destination: DecisionPoint
   created_at TIMESTAMP
 );
 
--- Table 4: Decision -> Candidate edges
--- Label is SELECTED_CANDIDATE or DROPPED_CANDIDATE based on is_selected
-CREATE TABLE IF NOT EXISTS \`project.dataset.edges_decision_to_candidate\` (
-  edge_id STRING NOT NULL,
-  decision_id STRING NOT NULL,     -- Source: DecisionPoint
-  candidate_id STRING NOT NULL,    -- Destination: Candidate
-  edge_label STRING NOT NULL,      -- "SELECTED_CANDIDATE" or "DROPPED_CANDIDATE"
+-- Table 4: CandidateEdge edges (DecisionPoint -> CandidateNode)
+CREATE TABLE IF NOT EXISTS \`project.dataset.candidate_edges\` (
+  edge_id STRING,
+  decision_id STRING,              -- Source: DecisionPoint
+  candidate_id STRING,             -- Destination: CandidateNode
+  edge_type STRING,                -- "SELECTED_CANDIDATE" or "DROPPED_CANDIDATE"
   rejection_rationale STRING,      -- EU audit: why was this candidate dropped?
   created_at TIMESTAMP
 );`,
@@ -267,8 +266,8 @@ CREATE TABLE IF NOT EXISTS \`project.dataset.edges_decision_to_candidate\` (
   propertyGraphDDL: {
     name: 'Extended Property Graph DDL',
     category: 'Graph',
-    sql: `-- Extended Property Graph with Decision Semantics
--- Adds DecisionPoint + Candidate nodes and MADE_DECISION / SELECTED / DROPPED edges
+    sql: `-- Extended Property Graph with Decision Semantics (6-pillar)
+-- Adds DecisionPoint + CandidateNode tables, MadeDecision + CandidateEdge edges
 CREATE OR REPLACE PROPERTY GRAPH \`project.dataset.agent_context_graph\`
   NODE TABLES (
     -- Pillar 1: Technical execution nodes (from ADK plugin)
@@ -281,15 +280,15 @@ CREATE OR REPLACE PROPERTY GRAPH \`project.dataset.agent_context_graph\`
       KEY (biz_node_id) LABEL BizNode
       PROPERTIES (node_type, node_value, confidence, session_id, artifact_uri),
 
-    -- NEW: Decision point nodes
-    \`project.dataset.decision_nodes\` AS DecisionPoint
+    -- Pillar 5: Decision point nodes
+    \`project.dataset.decision_points\` AS DecisionPoint
       KEY (decision_id) LABEL DecisionPoint
-      PROPERTIES (decision_type, rationale, session_id, span_id),
+      PROPERTIES (session_id, span_id, decision_type, description),
 
-    -- NEW: Candidate nodes (entities evaluated during decisions)
-    \`project.dataset.candidate_nodes\` AS Candidate
-      KEY (candidate_id) LABEL Candidate
-      PROPERTIES (candidate_value, candidate_type, score, is_selected, rejection_reason)
+    -- Pillar 6: Candidate nodes
+    \`project.dataset.candidates\` AS CandidateNode
+      KEY (candidate_id) LABEL CandidateNode
+      PROPERTIES (decision_id, session_id, name, score, status, rejection_rationale)
   )
   EDGE TABLES (
     -- Causal lineage: parent span -> child span
@@ -305,30 +304,22 @@ CREATE OR REPLACE PROPERTY GRAPH \`project.dataset.agent_context_graph\`
       SOURCE KEY (span_id) REFERENCES TechNode (span_id)
       DESTINATION KEY (biz_node_id) REFERENCES BizNode (biz_node_id)
       LABEL Evaluated
-      PROPERTIES (artifact_uri, link_type),
+      PROPERTIES (artifact_uri, link_type, created_at),
 
-    -- NEW: Span -> DecisionPoint
-    \`project.dataset.edges_span_to_decision\` AS MadeDecision
+    -- TechNode -> DecisionPoint (span that made the decision)
+    \`project.dataset.made_decision_edges\` AS MadeDecision
       KEY (edge_id)
       SOURCE KEY (span_id) REFERENCES TechNode (span_id)
       DESTINATION KEY (decision_id) REFERENCES DecisionPoint (decision_id)
       LABEL MadeDecision,
 
-    -- NEW: DecisionPoint -> Selected Candidate
-    \`project.dataset.edges_decision_to_candidate\` AS SelectedCandidate
+    -- DecisionPoint -> CandidateNode (selected or dropped)
+    \`project.dataset.candidate_edges\` AS CandidateEdge
       KEY (edge_id)
       SOURCE KEY (decision_id) REFERENCES DecisionPoint (decision_id)
-      DESTINATION KEY (candidate_id) REFERENCES Candidate (candidate_id)
-      LABEL SelectedCandidate
-      PROPERTIES (rejection_rationale),
-
-    -- NEW: DecisionPoint -> Dropped Candidate
-    \`project.dataset.edges_decision_to_candidate\` AS DroppedCandidate
-      KEY (edge_id)
-      SOURCE KEY (decision_id) REFERENCES DecisionPoint (decision_id)
-      DESTINATION KEY (candidate_id) REFERENCES Candidate (candidate_id)
-      LABEL DroppedCandidate
-      PROPERTIES (rejection_rationale)
+      DESTINATION KEY (candidate_id) REFERENCES CandidateNode (candidate_id)
+      LABEL CandidateEdge
+      PROPERTIES (edge_type, rejection_rationale, created_at)
   )`,
   },
   gqlAuditTrail: {
@@ -336,29 +327,26 @@ CREATE OR REPLACE PROPERTY GRAPH \`project.dataset.agent_context_graph\`
     category: 'Graph',
     sql: `-- EU Regulatory Audit Query:
 -- "Why was Athletes 18-35 selected instead of Fitness Enthusiasts?"
--- Traces from HITL decision -> DecisionPoint -> all Candidates (selected + dropped)
+-- Traces: TechNode -> MadeDecision -> DecisionPoint -> CandidateEdge -> CandidateNode
 
 GRAPH \`project.dataset.agent_context_graph\`
 MATCH
-  -- Trace from the HITL approval back through causal chain to the decision
-  (approval:TechNode)-[c:Caused]->{1,20}(step:TechNode)
-    -[md:MadeDecision]->(dp:DecisionPoint)
-    -[sc:SelectedCandidate|DroppedCandidate]->(candidate:Candidate)
-WHERE approval.event_type = 'HITL_CONFIRMATION_REQUEST_COMPLETED'
-  AND approval.session_id = @session_id
+  (step:TechNode)-[md:MadeDecision]->(dp:DecisionPoint)
+    -[ce:CandidateEdge]->(cand:CandidateNode)
+WHERE dp.session_id = @session_id
 RETURN
   dp.decision_id,
   dp.decision_type,
-  dp.rationale AS decision_rationale,
-  candidate.candidate_value,
-  candidate.score,
-  candidate.is_selected,
-  candidate.rejection_reason,
-  sc.rejection_rationale AS edge_rationale,
-  step.span_id AS decision_span_id,
-  step.event_type AS decision_event_type,
-  step.agent AS decision_agent
-ORDER BY candidate.is_selected DESC, candidate.score DESC`,
+  dp.description AS decision_description,
+  cand.name AS candidate_name,
+  cand.score AS candidate_score,
+  cand.status AS candidate_status,
+  cand.rejection_rationale,
+  ce.edge_type,
+  step.span_id,
+  step.event_type,
+  step.agent
+ORDER BY dp.decision_id, cand.score DESC`,
   },
   gqlDroppedOnly: {
     name: 'GQL: All Dropped Candidates with Rationale',
@@ -368,17 +356,17 @@ ORDER BY candidate.is_selected DESC, candidate.score DESC`,
 
 GRAPH \`project.dataset.agent_context_graph\`
 MATCH
-  (dp:DecisionPoint)-[dc:DroppedCandidate]->(dropped:Candidate)
+  (dp:DecisionPoint)-[ce:CandidateEdge]->(cand:CandidateNode)
 WHERE dp.session_id = @session_id
+  AND ce.edge_type = 'DROPPED_CANDIDATE'
 RETURN
   dp.decision_id,
   dp.decision_type,
-  dp.rationale AS overall_rationale,
-  dropped.candidate_value,
-  dropped.score,
-  dropped.rejection_reason,
-  dc.rejection_rationale AS edge_rationale
-ORDER BY dropped.score DESC`,
+  dp.description AS decision_description,
+  cand.name AS candidate_name,
+  cand.score AS candidate_score,
+  cand.rejection_rationale
+ORDER BY dp.decision_id, cand.score DESC`,
   },
 };
 
@@ -671,23 +659,25 @@ biz_nodes = cgm.extract_biz_nodes(
     use_ai_generate=True,
 )
 
-# Step 2: Extract decision points with candidates
-# Uses extended output_schema that includes:
-#   decision_rationale, candidates_evaluated[{candidate_value, score,
-#   is_selected, rejection_reason}]
-decisions = cgm.extract_decision_points(
+# Step 2: Extract decision points from agent traces
+decision_points, candidates = cgm.extract_decision_points(
     session_ids=["${session.id}"],
+    use_ai_generate=True,
 )
-print(f"Found {len(decisions)} decision points")
+print(f"Found {len(decision_points)} decision points")
+
+# Step 2b: Store pre-extracted decision points + candidates
+# (Idempotent: deletes existing data for the session first)
+cgm.store_decision_points(decision_points, candidates)
 
 # Step 3: Create cross-links + decision edges
 cgm.create_cross_links(["${session.id}"])
 cgm.create_decision_edges(["${session.id}"])
 
-# Step 4: Create extended Property Graph
-# Includes: TechNode, BizNode, DecisionPoint, Candidate
-# Edges: Caused, Evaluated, MadeDecision, SelectedCandidate, DroppedCandidate
-cgm.create_property_graph()
+# Step 4: Create extended Property Graph (6-pillar)
+# Nodes: TechNode, BizNode, DecisionPoint, CandidateNode
+# Edges: Caused, Evaluated, MadeDecision, CandidateEdge
+cgm.create_property_graph(include_decisions=True)
 
 # Step 5: EU Regulatory Audit — "Why was X chosen instead of Y?"
 audit_trail = cgm.explain_decision(
@@ -696,19 +686,21 @@ audit_trail = cgm.explain_decision(
     include_dropped=True,  # Include rejected candidates with rationale
 )
 
-for candidate in audit_trail:
-    status = "SELECTED" if candidate["is_selected"] else "DROPPED"
-    print(f"  {status}: {candidate['candidate_value']} "
-          f"(score={candidate['score']:.2f})")
-    if not candidate["is_selected"]:
-        print(f"    Reason: {candidate['rejection_reason']}")
+for result in audit_trail:
+    for decision in result.get("decision_candidates", []):
+        print(f"Decision: {decision['decision_type']}")
+        for c in decision["candidates"]:
+            print(f"  {c['status']}: {c['name']} "
+                  f"(score={c['score']:.2f})")
+            if c["status"] == "DROPPED":
+                print(f"    Reason: {c['rejection_rationale']}")
 
-# Step 6: Export audit trail as queryable unit
+# Step 6: Export audit trail (dict or JSON string)
 report = cgm.export_audit_trail(
     session_id="${session.id}",
-    format="json",
+    format="json",  # Returns JSON string; use "dict" for list of dicts
 )
-# report contains: decision_point, all candidates, rationale, timestamps
+# report contains: decision_point, all candidates, rationale
 # Satisfies: "Why was this ad shown instead of that one?"`;
 
   return (

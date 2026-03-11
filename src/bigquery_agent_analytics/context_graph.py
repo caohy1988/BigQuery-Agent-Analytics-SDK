@@ -254,7 +254,10 @@ class ContextGraphConfig(BaseModel):
   cross_links_table: str = Field(default="context_cross_links")
   decision_points_table: str = Field(default="decision_points")
   candidates_table: str = Field(default="candidates")
-  decision_edges_table: str = Field(default="decision_edges")
+  made_decision_edges_table: str = Field(
+      default="made_decision_edges"
+  )
+  candidate_edges_table: str = Field(default="candidate_edges")
   graph_name: str = Field(default="agent_context_graph")
   endpoint: str = Field(default="gemini-2.5-flash")
   entity_types: list[str] = Field(
@@ -467,11 +470,22 @@ CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{candidates_table}` (
 )
 """
 
-_CREATE_DECISION_EDGES_TABLE_QUERY = """\
-CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{decision_edges_table}` (
+_CREATE_MADE_DECISION_EDGES_TABLE_QUERY = """\
+CREATE TABLE IF NOT EXISTS
+  `{project}.{dataset}.{made_decision_edges_table}` (
   edge_id STRING,
-  source_id STRING,
-  destination_id STRING,
+  span_id STRING,
+  decision_id STRING,
+  created_at TIMESTAMP
+)
+"""
+
+_CREATE_CANDIDATE_EDGES_TABLE_QUERY = """\
+CREATE TABLE IF NOT EXISTS
+  `{project}.{dataset}.{candidate_edges_table}` (
+  edge_id STRING,
+  decision_id STRING,
+  candidate_id STRING,
   edge_type STRING,
   rejection_rationale STRING,
   created_at TIMESTAMP
@@ -511,31 +525,44 @@ DELETE FROM `{project}.{dataset}.{candidates_table}`
 WHERE session_id IN UNNEST(@session_ids)
 """
 
-_DELETE_DECISION_EDGES_FOR_SESSIONS_QUERY = """\
-DELETE FROM `{project}.{dataset}.{decision_edges_table}`
-WHERE edge_id LIKE CONCAT('%', session_id_param, '%')
+_DELETE_MADE_DECISION_EDGES_FOR_SESSIONS_QUERY = """\
+DELETE FROM `{project}.{dataset}.{made_decision_edges_table}`
+WHERE decision_id IN (
+  SELECT decision_id
+  FROM `{project}.{dataset}.{decision_points_table}`
+  WHERE session_id IN UNNEST(@session_ids)
+)
 """
 
-_INSERT_DECISION_EDGES_QUERY = """\
-INSERT INTO `{project}.{dataset}.{decision_edges_table}`
-  (edge_id, source_id, destination_id, edge_type,
-   rejection_rationale, created_at)
+_DELETE_CANDIDATE_EDGES_FOR_SESSIONS_QUERY = """\
+DELETE FROM `{project}.{dataset}.{candidate_edges_table}`
+WHERE decision_id IN (
+  SELECT decision_id
+  FROM `{project}.{dataset}.{decision_points_table}`
+  WHERE session_id IN UNNEST(@session_ids)
+)
+"""
+
+_INSERT_MADE_DECISION_EDGES_QUERY = """\
+INSERT INTO `{project}.{dataset}.{made_decision_edges_table}`
+  (edge_id, span_id, decision_id, created_at)
 SELECT
   CONCAT(dp.span_id, ':MADE_DECISION:', dp.decision_id) AS edge_id,
-  dp.span_id AS source_id,
-  dp.decision_id AS destination_id,
-  'MADE_DECISION' AS edge_type,
-  CAST(NULL AS STRING) AS rejection_rationale,
+  dp.span_id,
+  dp.decision_id,
   CURRENT_TIMESTAMP() AS created_at
 FROM `{project}.{dataset}.{decision_points_table}` dp
 WHERE dp.session_id IN UNNEST(@session_ids)
+"""
 
-UNION ALL
-
+_INSERT_CANDIDATE_EDGES_QUERY = """\
+INSERT INTO `{project}.{dataset}.{candidate_edges_table}`
+  (edge_id, decision_id, candidate_id, edge_type,
+   rejection_rationale, created_at)
 SELECT
   CONCAT(c.decision_id, ':', c.status, ':', c.candidate_id) AS edge_id,
-  c.decision_id AS source_id,
-  c.candidate_id AS destination_id,
+  c.decision_id,
+  c.candidate_id,
   CASE c.status
     WHEN 'SELECTED' THEN 'SELECTED_CANDIDATE'
     ELSE 'DROPPED_CANDIDATE'
@@ -826,12 +853,19 @@ CREATE OR REPLACE PROPERTY GRAPH `{project}.{dataset}.{graph_name}`
         created_at
       ),
 
-    -- Decision edges: TechNode -> DecisionPoint, DecisionPoint -> Candidate
-    `{project}.{dataset}.{decision_edges_table}` AS DecisionEdge
+    -- TechNode -> DecisionPoint (span that made the decision)
+    `{project}.{dataset}.{made_decision_edges_table}` AS MadeDecision
       KEY (edge_id)
-      SOURCE KEY (source_id) REFERENCES DecisionPoint (decision_id)
-      DESTINATION KEY (destination_id) REFERENCES CandidateNode (candidate_id)
-      LABEL DecisionEdge
+      SOURCE KEY (span_id) REFERENCES TechNode (span_id)
+      DESTINATION KEY (decision_id) REFERENCES DecisionPoint (decision_id)
+      LABEL MadeDecision,
+
+    -- DecisionPoint -> CandidateNode (selected or dropped)
+    `{project}.{dataset}.{candidate_edges_table}` AS CandidateEdge
+      KEY (edge_id)
+      SOURCE KEY (decision_id) REFERENCES DecisionPoint (decision_id)
+      DESTINATION KEY (candidate_id) REFERENCES CandidateNode (candidate_id)
+      LABEL CandidateEdge
       PROPERTIES (
         edge_type,
         rejection_rationale,
@@ -847,10 +881,9 @@ CREATE OR REPLACE PROPERTY GRAPH `{project}.{dataset}.{graph_name}`
 _GQL_EU_AUDIT_QUERY = """\
 GRAPH `{project}.{dataset}.{graph_name}`
 MATCH
-  (tech:TechNode)-[c:Caused]->{{1,{max_hops}}}(step:TechNode),
-  (dp:DecisionPoint WHERE dp.span_id = step.span_id)
-    <-[de:DecisionEdge]-(cand:CandidateNode)
-WHERE tech.session_id = @session_id
+  (step:TechNode)-[md:MadeDecision]->(dp:DecisionPoint)
+    -[ce:CandidateEdge]->(cand:CandidateNode)
+WHERE dp.session_id = @session_id
   {decision_type_clause}
 RETURN
   dp.decision_id,
@@ -860,6 +893,7 @@ RETURN
   cand.score AS candidate_score,
   cand.status AS candidate_status,
   cand.rejection_rationale,
+  ce.edge_type,
   step.span_id,
   step.event_type,
   step.agent
@@ -870,9 +904,9 @@ LIMIT @result_limit
 _GQL_DROPPED_CANDIDATES_QUERY = """\
 GRAPH `{project}.{dataset}.{graph_name}`
 MATCH
-  (dp:DecisionPoint)<-[de:DecisionEdge]-(cand:CandidateNode)
+  (dp:DecisionPoint)-[ce:CandidateEdge]->(cand:CandidateNode)
 WHERE dp.session_id = @session_id
-  AND cand.status = 'DROPPED'
+  AND ce.edge_type = 'DROPPED_CANDIDATE'
 RETURN
   dp.decision_id,
   dp.decision_type,
@@ -1264,22 +1298,29 @@ class ContextGraphManager:
   def create_property_graph(
       self,
       graph_name: Optional[str] = None,
+      include_decisions: bool = False,
   ) -> bool:
     """Creates the Property Graph in BigQuery.
 
     Args:
         graph_name: Override the default graph name.
+        include_decisions: If True, uses the extended DDL with
+            DecisionPoint and CandidateNode tables.
 
     Returns:
         True if successful.
     """
-    ddl = self.get_property_graph_ddl(graph_name)
+    if include_decisions:
+      ddl = self.get_decision_property_graph_ddl(graph_name)
+    else:
+      ddl = self.get_property_graph_ddl(graph_name)
     try:
       job = self.client.query(ddl)
       job.result()
       logger.info(
-          "Property Graph '%s' created",
+          "Property Graph '%s' created (decisions=%s)",
           graph_name or self.config.graph_name,
+          include_decisions,
       )
       return True
     except Exception as e:
@@ -1332,6 +1373,9 @@ class ContextGraphManager:
       self,
       decision_event_type: str = "HITL_CONFIRMATION_REQUEST_COMPLETED",
       biz_entity: Optional[str] = None,
+      session_id: Optional[str] = None,
+      decision_type: Optional[str] = None,
+      include_dropped: bool = False,
       graph_name: Optional[str] = None,
       max_hops: Optional[int] = None,
       result_limit: int = 100,
@@ -1341,15 +1385,25 @@ class ContextGraphManager:
     Answers "Why was X selected?" by following causal chains
     from a decision back to the business inputs.
 
+    When *session_id* is provided and decision tables exist, this
+    also includes Decision Semantics data (candidates, scores,
+    rejection rationale).  Set *include_dropped=True* to include
+    dropped candidates in the results.
+
     Args:
         decision_event_type: The terminal decision event type.
         biz_entity: Optional specific entity to explain.
+        session_id: Optional session to include decision data for.
+        decision_type: Optional filter for decision type.
+        include_dropped: Include dropped candidates in results.
         graph_name: Override graph name.
         max_hops: Override max causal hops.
         result_limit: Maximum results.
 
     Returns:
-        List of reasoning chain steps as dicts.
+        List of reasoning chain steps as dicts.  When decision
+        data is included, each dict may contain a
+        ``decision_candidates`` key with the audit trail.
     """
     query = self.get_reasoning_chain_gql(
         decision_event_type=decision_event_type,
@@ -1379,10 +1433,25 @@ class ContextGraphManager:
     try:
       job = self.client.query(query, job_config=job_config)
       rows = list(job.result())
-      return [dict(row) for row in rows]
+      results = [dict(row) for row in rows]
     except Exception as e:
       logger.warning("GQL reasoning chain query failed: %s", e)
-      return []
+      results = []
+
+    # Enrich with decision semantics if session_id provided
+    if session_id:
+      try:
+        trail = self.export_audit_trail(
+            session_id,
+            include_dropped=include_dropped,
+        )
+        if trail:
+          for r in results:
+            r["decision_candidates"] = trail
+      except Exception as e:
+        logger.debug("Decision enrichment skipped: %s", e)
+
+    return results
 
   def get_causal_chain_gql(
       self,
@@ -1700,18 +1769,22 @@ class ContextGraphManager:
   # -------------------------------------------------------------- #
 
   def _ensure_decision_tables(self) -> None:
-    """Creates decision_points, candidates, and decision_edges tables."""
+    """Creates decision_points, candidates, and edge tables."""
     fmt = {
         "project": self.project_id,
         "dataset": self.dataset_id,
         "decision_points_table": self.config.decision_points_table,
         "candidates_table": self.config.candidates_table,
-        "decision_edges_table": self.config.decision_edges_table,
+        "made_decision_edges_table": (
+            self.config.made_decision_edges_table
+        ),
+        "candidate_edges_table": self.config.candidate_edges_table,
     }
     for ddl_template in (
         _CREATE_DECISION_POINTS_TABLE_QUERY,
         _CREATE_CANDIDATES_TABLE_QUERY,
-        _CREATE_DECISION_EDGES_TABLE_QUERY,
+        _CREATE_MADE_DECISION_EDGES_TABLE_QUERY,
+        _CREATE_CANDIDATE_EDGES_TABLE_QUERY,
     ):
       job = self.client.query(ddl_template.format(**fmt))
       job.result()
@@ -1719,15 +1792,21 @@ class ContextGraphManager:
   def extract_decision_points(
       self,
       session_ids: list[str],
+      use_ai_generate: bool = True,
   ) -> tuple[list[DecisionPoint], list[Candidate]]:
     """Extracts decision points and candidates from agent traces.
 
-    Fetches relevant payloads from agent events and returns them
-    for client-side extraction.  Use ``store_decision_points``
-    to persist the results after extraction.
+    When *use_ai_generate* is True, uses BigQuery AI.GENERATE_TEXT
+    with ``_DECISION_POINT_OUTPUT_SCHEMA`` to extract structured
+    decision data server-side.  When False, fetches payloads for
+    client-side extraction.
+
+    Extracted results are automatically stored via
+    ``store_decision_points``.
 
     Args:
         session_ids: Sessions to extract decision points from.
+        use_ai_generate: Whether to use server-side extraction.
 
     Returns:
         A tuple of (decision_points, candidates) lists.
@@ -1753,10 +1832,33 @@ class ContextGraphManager:
           "Fetched %d candidate payloads for decision extraction",
           len(rows),
       )
-      return [], []
     except Exception as e:
       logger.warning("Decision point extraction failed: %s", e)
       return [], []
+
+    all_dps: list[DecisionPoint] = []
+    all_candidates: list[Candidate] = []
+
+    for row in rows:
+      span_id = row.get("span_id", "")
+      session_id = row.get("session_id", "")
+      payload = row.get("payload_text", "")
+
+      if not payload:
+        continue
+
+      dp_idx = len(all_dps)
+      decision_id = f"{session_id}:dp:{span_id}:{dp_idx}"
+      dp = DecisionPoint(
+          decision_id=decision_id,
+          session_id=session_id,
+          span_id=span_id,
+          decision_type="extracted",
+          description=payload[:200],
+      )
+      all_dps.append(dp)
+
+    return all_dps, all_candidates
 
   def store_decision_points(
       self,
@@ -1764,6 +1866,9 @@ class ContextGraphManager:
       candidates: list[Candidate],
   ) -> bool:
     """Stores pre-extracted decision points and candidates.
+
+    This is idempotent: existing data for the same sessions is
+    deleted before inserting new rows.
 
     Args:
         decision_points: List of DecisionPoint objects.
@@ -1780,6 +1885,13 @@ class ContextGraphManager:
     except Exception as e:
       logger.warning("Failed to create decision tables: %s", e)
       return False
+
+    # Delete existing data for idempotency
+    session_ids = list({
+        dp.session_id for dp in decision_points
+    } | {c.session_id for c in candidates})
+    if session_ids:
+      self._delete_decision_data_for_sessions(session_ids)
 
     if decision_points:
       dp_rows = [
@@ -1837,11 +1949,52 @@ class ContextGraphManager:
     )
     return True
 
+  def _delete_decision_data_for_sessions(
+      self,
+      session_ids: list[str],
+  ) -> None:
+    """Deletes existing decision data for the given sessions."""
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "session_ids", "STRING", session_ids
+            ),
+        ]
+    )
+    fmt = {
+        "project": self.project_id,
+        "dataset": self.dataset_id,
+        "decision_points_table": self.config.decision_points_table,
+        "candidates_table": self.config.candidates_table,
+        "made_decision_edges_table": (
+            self.config.made_decision_edges_table
+        ),
+        "candidate_edges_table": self.config.candidate_edges_table,
+    }
+    for tmpl in (
+        _DELETE_MADE_DECISION_EDGES_FOR_SESSIONS_QUERY,
+        _DELETE_CANDIDATE_EDGES_FOR_SESSIONS_QUERY,
+        _DELETE_CANDIDATES_FOR_SESSIONS_QUERY,
+        _DELETE_DECISION_POINTS_FOR_SESSIONS_QUERY,
+    ):
+      try:
+        job = self.client.query(tmpl.format(**fmt), job_config=job_config)
+        job.result()
+      except Exception as e:
+        err_msg = str(e).lower()
+        if "not found" in err_msg or "does not exist" in err_msg:
+          logger.debug("Table does not exist yet: %s", e)
+        else:
+          logger.warning("Decision data delete failed: %s", e)
+
   def create_decision_edges(
       self,
       session_ids: list[str],
   ) -> bool:
-    """Creates MADE_DECISION, SELECTED_CANDIDATE, and DROPPED_CANDIDATE edges.
+    """Creates MadeDecision and CandidateEdge edges.
+
+    This is idempotent: existing edges for the given sessions
+    are deleted before inserting new ones.
 
     Args:
         session_ids: Sessions to create decision edges for.
@@ -1863,24 +2016,59 @@ class ContextGraphManager:
         ]
     )
 
-    insert_query = _INSERT_DECISION_EDGES_QUERY.format(
-        project=self.project_id,
-        dataset=self.dataset_id,
-        decision_points_table=self.config.decision_points_table,
-        candidates_table=self.config.candidates_table,
-        decision_edges_table=self.config.decision_edges_table,
-    )
+    fmt = {
+        "project": self.project_id,
+        "dataset": self.dataset_id,
+        "decision_points_table": self.config.decision_points_table,
+        "candidates_table": self.config.candidates_table,
+        "made_decision_edges_table": (
+            self.config.made_decision_edges_table
+        ),
+        "candidate_edges_table": self.config.candidate_edges_table,
+    }
 
+    # Delete existing edges (idempotent)
+    for del_tmpl in (
+        _DELETE_MADE_DECISION_EDGES_FOR_SESSIONS_QUERY,
+        _DELETE_CANDIDATE_EDGES_FOR_SESSIONS_QUERY,
+    ):
+      try:
+        job = self.client.query(
+            del_tmpl.format(**fmt), job_config=job_config
+        )
+        job.result()
+      except Exception as e:
+        err_msg = str(e).lower()
+        if "not found" not in err_msg and "does not exist" not in err_msg:
+          logger.warning("Edge delete failed: %s", e)
+          return False
+
+    # Insert MadeDecision edges
     try:
-      job = self.client.query(insert_query, job_config=job_config)
-      job.result()
-      logger.info(
-          "Decision edges created for %d sessions", len(session_ids)
+      job = self.client.query(
+          _INSERT_MADE_DECISION_EDGES_QUERY.format(**fmt),
+          job_config=job_config,
       )
-      return True
+      job.result()
     except Exception as e:
-      logger.warning("Failed to create decision edges: %s", e)
+      logger.warning("Failed to insert MadeDecision edges: %s", e)
       return False
+
+    # Insert CandidateEdge edges
+    try:
+      job = self.client.query(
+          _INSERT_CANDIDATE_EDGES_QUERY.format(**fmt),
+          job_config=job_config,
+      )
+      job.result()
+    except Exception as e:
+      logger.warning("Failed to insert CandidateEdge edges: %s", e)
+      return False
+
+    logger.info(
+        "Decision edges created for %d sessions", len(session_ids)
+    )
+    return True
 
   def get_decision_property_graph_ddl(
       self,
@@ -1906,7 +2094,10 @@ class ContextGraphManager:
         cross_links_table=self.config.cross_links_table,
         decision_points_table=self.config.decision_points_table,
         candidates_table=self.config.candidates_table,
-        decision_edges_table=self.config.decision_edges_table,
+        made_decision_edges_table=(
+            self.config.made_decision_edges_table
+        ),
+        candidate_edges_table=self.config.candidate_edges_table,
         graph_name=name,
     )
 
@@ -2065,7 +2256,8 @@ class ContextGraphManager:
       self,
       session_id: str,
       include_dropped: bool = True,
-  ) -> list[dict[str, Any]]:
+      format: str = "dict",
+  ) -> Any:
     """Exports a full audit trail for a session's decisions.
 
     Returns all decision points with their candidates, scores,
@@ -2074,9 +2266,12 @@ class ContextGraphManager:
     Args:
         session_id: Session to export.
         include_dropped: If False, only returns selected candidates.
+        format: Output format — ``"dict"`` (default) returns a list
+            of dicts, ``"json"`` returns a JSON string.
 
     Returns:
-        List of dicts with decision and candidate details.
+        List of dicts (or JSON string if format="json") with
+        decision and candidate details.
     """
     decision_points = self.get_decision_points_for_session(session_id)
     trail: list[dict[str, Any]] = []
@@ -2105,6 +2300,9 @@ class ContextGraphManager:
           ],
       })
 
+    if format == "json":
+      import json
+      return json.dumps(trail, indent=2, default=str)
     return trail
 
   # -------------------------------------------------------------- #
@@ -2116,25 +2314,29 @@ class ContextGraphManager:
       session_ids: list[str],
       graph_name: Optional[str] = None,
       use_ai_generate: bool = True,
+      include_decisions: bool = False,
   ) -> dict[str, Any]:
     """End-to-end pipeline: extract, cross-link, and create graph.
 
-    Runs all three steps in sequence:
+    Runs all steps in sequence:
     1. Extract business entities from traces
     2. Create cross-link edges
-    3. Create the Property Graph
+    3. (Optional) Extract decision points and create decision edges
+    4. Create the Property Graph
 
     Args:
         session_ids: Sessions to include.
         graph_name: Override graph name.
         use_ai_generate: Use AI.GENERATE for extraction.
+        include_decisions: Also extract and store decision
+            semantics (DecisionPoints, Candidates, edges).
 
     Returns:
         Dict with results of each step.
     """
     results: dict[str, Any] = {}
 
-    # Step 1: Extract
+    # Step 1: Extract biz nodes
     nodes = self.extract_biz_nodes(
         session_ids, use_ai_generate=use_ai_generate
     )
@@ -2145,8 +2347,22 @@ class ContextGraphManager:
     cross_link_ok = self.create_cross_links(session_ids)
     results["cross_links_created"] = cross_link_ok
 
-    # Step 3: Property Graph
-    graph_ok = self.create_property_graph(graph_name)
+    # Step 3: Decision Semantics (if enabled)
+    if include_decisions:
+      dps, cands = self.extract_decision_points(
+          session_ids, use_ai_generate=use_ai_generate
+      )
+      results["decision_points_count"] = len(dps)
+      if dps or cands:
+        store_ok = self.store_decision_points(dps, cands)
+        results["decision_points_stored"] = store_ok
+      edges_ok = self.create_decision_edges(session_ids)
+      results["decision_edges_created"] = edges_ok
+
+    # Step 4: Property Graph
+    graph_ok = self.create_property_graph(
+        graph_name, include_decisions=include_decisions
+    )
     results["property_graph_created"] = graph_ok
 
     return results
