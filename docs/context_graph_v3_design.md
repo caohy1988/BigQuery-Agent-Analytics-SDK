@@ -54,7 +54,7 @@ Two sessions demonstrate decision semantics in action:
 | Session | Client | Decision Type | Candidates | Selected | Dropped | Rejection Reason |
 |---------|--------|---------------|------------|----------|---------|-----------------|
 | `sess-nike-summer` | Nike | `audience_selection` | 3 | Athletes 18-35 (0.92) | Fitness Enthusiasts (0.71), Running Community (0.65) | Budget constraints |
-| `sess-elf-cosmetics` | ELF Cosmetics | `placement_selection` | 3 | Instagram Reels (0.88), TikTok In-Feed (0.85) | YouTube Pre-Roll (0.45) | Audience mismatch |
+| `sess-elf-cosmetics` | ELF Cosmetics | `placement_selection` | 4 | Instagram Reels (0.95), TikTok TopView (0.93) | LinkedIn Sponsored (0.22), Yahoo Homepage (0.31) | Audience mismatch (Gen Z affinity below 0.70) |
 
 ---
 
@@ -713,9 +713,10 @@ Example from the ELF Cosmetics placement selection:
 
 | Candidate | Score | Status | Rationale |
 |-----------|-------|--------|-----------|
-| Instagram Reels | 0.88 | SELECTED | — |
-| TikTok In-Feed | 0.85 | SELECTED | — |
-| YouTube Pre-Roll | 0.45 | DROPPED | Audience mismatch |
+| Instagram Reels | 0.95 | SELECTED | — |
+| TikTok TopView | 0.93 | SELECTED | — |
+| LinkedIn Sponsored | 0.22 | DROPPED | Gen Z affinity below 0.70 threshold; skews professional/35+ demographic |
+| Yahoo Homepage | 0.31 | DROPPED | Gen Z affinity below 0.70 threshold; audience skews older demographic |
 
 ### 5.6 Dual-Path Decision Explanation
 
@@ -773,28 +774,22 @@ trail = cgm.export_audit_trail(
 
 ## 6. Production Query Patterns
 
-The demo includes 7 production-ready BigQuery queries covering the full Context Graph workflow.
+The demo includes 5 production-ready BigQuery queries covering the Decision Semantics workflow.
 
-### 6.1 Extract Business Entities (AI.GENERATE + output_schema)
-Uses `AI.GENERATE` with `output_schema` to extract typed business entities (Product, Targeting, Campaign, Budget) from agent trace payloads. MERGE with 3-way logic handles upsert and stale cleanup in a single statement.
+### 6.1 Extended AI.GENERATE output_schema (Decision Extraction)
+Uses `AI.GENERATE` with `_DECISION_POINT_OUTPUT_SCHEMA` to extract structured decision data from agent payloads, including decision type, description, and all candidates with scores, status, and rejection rationale. Uses MERGE with 3-way logic for upsert and stale cleanup.
 
-### 6.2 Extract Decision Points (AI.GENERATE + output_schema — NEW in V3)
-Uses `AI.GENERATE` with `_DECISION_POINT_OUTPUT_SCHEMA` to extract structured decision data from agent payloads, including decision type, description, and all candidates with scores, status, and rejection rationale. The SDK parses the JSON response into `DecisionPoint` and `Candidate` objects.
+### 6.2 Decision & Candidate Tables DDL
+`CREATE TABLE IF NOT EXISTS` DDL for the `decision_points`, `candidates`, `made_decision_edges`, and `candidate_edges` tables that support the Decision Semantics extension.
 
-### 6.3 Property Graph DDL (6-Pillar Architecture)
+### 6.3 Extended Property Graph DDL (6-Pillar Architecture)
 `CREATE OR REPLACE PROPERTY GRAPH` DDL defining the 6-pillar graph: TechNode vertices (from `agent_events`), BizNode vertices (from `biz_nodes`), DecisionPoint vertices (from `decision_points`), CandidateNode vertices (from `candidates`), Caused edges (span lineage), Evaluated edges (cross-links), MadeDecision edges (span→decision), and CandidateEdge edges (decision→candidate).
 
-### 6.4 GQL Reasoning Chain ("Why was X selected?")
-Quantified-path GQL query that traverses from a HITL decision event through up to 20 hops of causal lineage to the business entities that influenced the decision. Returns the full reasoning chain with confidence scores and artifact URIs.
-
-### 6.5 GQL EU Audit Trail (NEW in V3)
+### 6.4 GQL EU Audit Trail ("Why was X shown instead of Y?")
 Forward GQL traversal from TechNode through MadeDecision to DecisionPoint to CandidateEdge to CandidateNode. Returns all candidates with scores, selection status, and rejection rationale. Supports optional `decision_type` filtering.
 
-### 6.6 GQL Dropped Candidates (NEW in V3)
+### 6.5 GQL Dropped Candidates with Rationale
 Filters CandidateEdge edges by `edge_type = 'DROPPED_CANDIDATE'` to surface all rejected options with rationale. Supports EU regulatory compliance requirements for explainability of automated decisions.
-
-### 6.7 World-Change Detection (Fail-Closed)
-Joins BizNodes with agent events to retrieve `evaluated_at` timestamps. The Python SDK layer applies the `current_state_fn` callback and enforces fail-closed semantics.
 
 ---
 
@@ -807,22 +802,21 @@ Interactive SVG-based graph rendering of the 6-pillar architecture. TechNodes (c
 Dedicated panel showing the complete audit trail for the selected session. Displays all decision points with their candidates, scores, selection status, and rejection rationale. Dropped candidates are highlighted with the reason for rejection. Supports both the full audit view and filtered views (selected-only, dropped-only).
 
 ### 7.3 SQL / GQL Query Explorer
-Interactive query browser with 7 production-ready queries. Each query includes full SQL/GQL, category badges (Extraction, Graph, Safety, Audit), and feature tags (AI.GENERATE, output_schema, Property Graph, GQL, Decision Semantics). Syntax-highlighted with dark theme and copy-to-clipboard support.
+Interactive query browser with 5 production-ready queries. Each query includes full SQL/GQL, category badges (Extraction, Graph, Audit), and feature tags (AI.GENERATE, output_schema, Property Graph, GQL, Decision Semantics). Syntax-highlighted with dark theme and copy-to-clipboard support.
 
 ### 7.4 Python SDK Panel
 Live-updating Python code showing the full SDK workflow for the selected session:
 1. Initialize `ContextGraphManager` with `ContextGraphConfig`
-2. Extract BizNodes via `AI.GENERATE + output_schema`
-3. Extract DecisionPoints and Candidates via `AI.GENERATE + output_schema`
-4. Store decision points and create decision edges
-5. Create Property Graph (6-pillar with `include_decisions=True`)
-6. EU audit trail via `cgm.get_eu_audit_gql()`
-7. Explain decisions via `cgm.explain_decision(session_id=..., decision_type=...)`
-8. Export audit trail via `cgm.export_audit_trail()`
-9. World-change detection via `cgm.detect_world_changes()`
+2. Extract BizNodes via `cgm.extract_biz_nodes()`
+3. Extract DecisionPoints and Candidates via `cgm.extract_decision_points()`
+4. Store decision points via `cgm.store_decision_points()`
+5. Create cross-links and decision edges via `cgm.create_cross_links()` and `cgm.create_decision_edges()`
+6. Create Property Graph (6-pillar with `include_decisions=True`)
+7. Explain decisions via `cgm.explain_decision(session_id=..., decision_type=..., include_dropped=True)`
+8. Export audit trail via `cgm.export_audit_trail(session_id=..., format="json")`
 
 ### 7.5 Session Selector
-Switch between ADCP sessions demonstrating different decision semantics outcomes: Nike (audience selection with 2 dropped candidates due to budget) and ELF Cosmetics (placement selection with 1 dropped candidate due to audience mismatch). Each session shows decision counts, candidate counts, selected/dropped breakdown, and decision types.
+Switch between ADCP sessions demonstrating different decision semantics outcomes: Nike (audience selection with 3 candidates, 2 dropped due to budget) and ELF Cosmetics (placement selection with 4 candidates, 2 dropped due to audience mismatch). Each session shows decision counts, candidate counts, selected/dropped breakdown, and decision types.
 
 ---
 
