@@ -36,6 +36,9 @@ llm = [
 bigframes = [
   "bigframes>=1.0.0",
 ]
+cli = [
+  "typer>=0.9.0",
+]
 dev = [
   "pytest>=7.0",
   "pytest-asyncio>=0.21",
@@ -43,8 +46,11 @@ dev = [
   "isort>=5.0",
 ]
 all = [
-  "bigquery-agent-analytics[llm,bigframes,dev]",
+  "bigquery-agent-analytics[llm,bigframes,cli,dev]",
 ]
+
+[project.scripts]
+bq-agent-sdk = "bigquery_agent_analytics.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bigquery_agent_analytics"]
