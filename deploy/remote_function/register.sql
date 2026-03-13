@@ -12,14 +12,21 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- Replace PROJECT, DATASET, and REGION with your values before running.
+-- Replace placeholders before running:
+--   PROJECT         — GCP project ID
+--   DATASET         — BigQuery dataset name
+--   BQ_LOCATION     — BigQuery dataset location (e.g. US, EU, us-central1)
+--   FUNCTION_REGION — Cloud Function region (e.g. us-central1)
+--
 -- The connection must already exist (deploy.sh creates it).
+-- BQ_LOCATION must match the dataset's location, which may differ from
+-- the Cloud Function's region.
 
 CREATE OR REPLACE FUNCTION `PROJECT.DATASET.agent_analytics`(
   operation STRING, params JSON
 ) RETURNS JSON
-REMOTE WITH CONNECTION `PROJECT.REGION.analytics-conn`
+REMOTE WITH CONNECTION `PROJECT.BQ_LOCATION.analytics-conn`
 OPTIONS (
-  endpoint = 'https://REGION-PROJECT.cloudfunctions.net/bq-agent-analytics',
+  endpoint = 'https://FUNCTION_REGION-PROJECT.cloudfunctions.net/bq-agent-analytics',
   max_batching_rows = 50
 );
