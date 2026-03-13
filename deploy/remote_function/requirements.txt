@@ -1,0 +1,2 @@
+functions-framework==3.*
+bigquery-agent-analytics[llm]>=0.2.0
