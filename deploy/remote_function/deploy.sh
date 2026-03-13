@@ -40,10 +40,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Cloud Functions deploys only the --source directory.  We build a
 # temporary staging area that contains:
 #   1. main.py + dispatch.py (Cloud Function code)
-#   2. requirements.txt
+#   2. requirements.txt (generated — not checked in, because it must
+#      reference the local SDK wheel by filename)
 #   3. The SDK wheel built from the repo working tree
 # This ensures the deployed function always runs the checked-in SDK,
 # not whatever version is on PyPI.
+#
+# NOTE: Do not deploy deploy/remote_function/ directly with gcloud.
+#       Always use this script so the SDK wheel is bundled correctly.
 
 STAGING="$(mktemp -d)"
 trap 'rm -rf "$STAGING"' EXIT
