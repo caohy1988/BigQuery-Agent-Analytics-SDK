@@ -19,10 +19,13 @@
 --   2. Register it (deploy/remote_function/register.sql)
 --
 -- Replace PROJECT and DATASET with your values.
+-- All queries use the fully-qualified function name
+-- `PROJECT.DATASET.agent_analytics` as created by register.sql.
 
 -- ------------------------------------------------------------------ --
 -- 1. Analyze a specific session                                       --
 -- ------------------------------------------------------------------ --
+-- Serialized shape: {trace_id, session_id, total_latency_ms, spans, ...}
 
 SELECT
   JSON_VALUE(result, '$.trace_id') AS trace_id,
@@ -46,13 +49,19 @@ FROM (
 -- ------------------------------------------------------------------ --
 -- 2. Evaluate latency across recent sessions                          --
 -- ------------------------------------------------------------------ --
+-- Serialized shape: {evaluator_name, total_sessions, passed_sessions,
+--   failed_sessions, aggregate_scores, session_scores, created_at, ...}
+-- Note: pass_rate is NOT serialized; compute it from passed/total.
 
 SELECT
   JSON_VALUE(result, '$.evaluator_name') AS evaluator,
   CAST(JSON_VALUE(result, '$.total_sessions') AS INT64) AS total,
   CAST(JSON_VALUE(result, '$.passed_sessions') AS INT64) AS passed,
   CAST(JSON_VALUE(result, '$.failed_sessions') AS INT64) AS failed,
-  CAST(JSON_VALUE(result, '$.pass_rate') AS FLOAT64) AS pass_rate
+  SAFE_DIVIDE(
+    CAST(JSON_VALUE(result, '$.passed_sessions') AS INT64),
+    CAST(JSON_VALUE(result, '$.total_sessions') AS INT64)
+  ) AS pass_rate
 FROM (
   SELECT
     `PROJECT.DATASET.agent_analytics`(
@@ -68,7 +77,10 @@ FROM (
 
 SELECT
   metric,
-  CAST(JSON_VALUE(result, '$.pass_rate') AS FLOAT64) AS pass_rate,
+  SAFE_DIVIDE(
+    CAST(JSON_VALUE(result, '$.passed_sessions') AS INT64),
+    CAST(JSON_VALUE(result, '$.total_sessions') AS INT64)
+  ) AS pass_rate,
   CAST(JSON_VALUE(result, '$.total_sessions') AS INT64) AS total
 FROM
   UNNEST(['latency', 'error_rate', 'ttft', 'cost']) AS metric,
@@ -83,6 +95,8 @@ FROM
 -- ------------------------------------------------------------------ --
 -- 4. Get insights summary                                             --
 -- ------------------------------------------------------------------ --
+-- Serialized shape: {aggregated: {total_sessions, success_rate,
+--   avg_latency_ms, error_rate, ...}, executive_summary, ...}
 
 SELECT
   CAST(JSON_VALUE(result, '$.aggregated.total_sessions') AS INT64) AS sessions,

@@ -1554,7 +1554,7 @@ operations directly from SQL.
 
 ```
 BigQuery SQL
-  └── SELECT agent_analytics('analyze', JSON'{"session_id":"s1"}')
+  └── SELECT `PROJECT.DATASET.agent_analytics`('analyze', JSON'{"session_id":"s1"}')
         └── REMOTE WITH CONNECTION
               └── Cloud Function (gen2)
                     └── SDK Client (local wheel)
@@ -1578,11 +1578,14 @@ The script:
 ### Supported Operations
 
 ```sql
+-- All examples use the fully-qualified function name created by
+-- register.sql: `PROJECT.DATASET.agent_analytics`.
+
 -- Analyze a session trace
-SELECT agent_analytics('analyze', JSON'{"session_id": "s1"}');
+SELECT `PROJECT.DATASET.agent_analytics`('analyze', JSON'{"session_id": "s1"}');
 
 -- Run a code evaluator
-SELECT agent_analytics('evaluate', JSON'{
+SELECT `PROJECT.DATASET.agent_analytics`('evaluate', JSON'{
   "metric": "latency",
   "threshold": 5000,
   "agent_filter": "bot",
@@ -1590,16 +1593,16 @@ SELECT agent_analytics('evaluate', JSON'{
 }');
 
 -- Run an LLM judge
-SELECT agent_analytics('judge', JSON'{
+SELECT `PROJECT.DATASET.agent_analytics`('judge', JSON'{
   "criterion": "correctness",
   "threshold": 0.7
 }');
 
 -- Generate insights
-SELECT agent_analytics('insights', JSON'{"last": "7d"}');
+SELECT `PROJECT.DATASET.agent_analytics`('insights', JSON'{"last": "7d"}');
 
 -- Detect drift
-SELECT agent_analytics('drift', JSON'{
+SELECT `PROJECT.DATASET.agent_analytics`('drift', JSON'{
   "golden_dataset": "golden_questions"
 }');
 ```

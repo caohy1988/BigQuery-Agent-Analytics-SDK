@@ -163,11 +163,15 @@ cd deploy/remote_function
 ./deploy.sh my-project us-central1 agent_analytics US
 ```
 
-Then query from SQL:
+Then query from SQL (using the fully-qualified name from `register.sql`):
 
 ```sql
-SELECT agent_analytics('analyze', JSON'{"session_id": "s1"}');
-SELECT agent_analytics('evaluate', JSON'{"metric": "latency"}');
+SELECT `my-project.agent_analytics.agent_analytics`(
+  'analyze', JSON'{"session_id": "s1"}'
+);
+SELECT `my-project.agent_analytics.agent_analytics`(
+  'evaluate', JSON'{"metric": "latency"}'
+);
 ```
 
 See [SDK.md](SDK.md) for the full CLI reference, Remote Function API,
