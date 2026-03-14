@@ -129,6 +129,50 @@ print(health.warnings)
 graduated = suite.auto_graduate(pass_history, threshold_runs=10)
 ```
 
+### CLI Quick Start
+
+The SDK includes a CLI for diagnostics, evaluation, and analytics:
+
+```bash
+# Health check
+bq-agent-sdk doctor --project-id=P --dataset-id=D
+
+# Retrieve a trace
+bq-agent-sdk get-trace --project-id=P --dataset-id=D --session-id=S
+
+# Run evaluation (CI gate with --exit-code)
+bq-agent-sdk evaluate --project-id=P --dataset-id=D \
+  --evaluator=latency --exit-code
+
+# Generate insights
+bq-agent-sdk insights --project-id=P --dataset-id=D --last=7d
+
+# All 10 commands: doctor, get-trace, evaluate, insights, drift,
+# distribution, hitl-metrics, list-traces, views create-all, views create
+```
+
+Set `BQ_AGENT_PROJECT` and `BQ_AGENT_DATASET` environment variables to
+skip `--project-id` and `--dataset-id` on every call.
+
+### Remote Function (BigQuery SQL)
+
+Deploy the SDK as a BigQuery Remote Function for SQL-native access:
+
+```bash
+cd deploy/remote_function
+./deploy.sh my-project us-central1 agent_analytics US
+```
+
+Then query from SQL:
+
+```sql
+SELECT agent_analytics('analyze', JSON'{"session_id": "s1"}');
+SELECT agent_analytics('evaluate', JSON'{"metric": "latency"}');
+```
+
+See [SDK.md](SDK.md) for the full CLI reference, Remote Function API,
+and continuous query templates.
+
 ## Architecture
 
 ```
@@ -149,7 +193,10 @@ bigquery_agent_analytics/
 ├── bigframes_evaluator.py   # BigFrames DataFrame evaluator
 ├── context_graph.py         # Property Graph: BizNode extraction, GQL, world-change
 ├── event_semantics.py       # Canonical event type helpers & predicates
-└── views.py                 # Per-event-type BigQuery view management
+├── views.py                 # Per-event-type BigQuery view management
+├── cli.py                   # CLI entry point (bq-agent-sdk)
+├── formatter.py             # Output formatting (json/text/table)
+└── serialization.py         # Uniform serialization layer
 ```
 
 ## Development

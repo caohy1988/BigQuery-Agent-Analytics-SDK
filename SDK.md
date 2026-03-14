@@ -1424,6 +1424,251 @@ WorldChangeAlert (Pydantic)
 
 ---
 
+## 18. CLI (`bq-agent-sdk`)
+
+The SDK ships a command-line interface for diagnostics, evaluation, and
+analytics — useful in CI/CD pipelines, ad-hoc debugging, and agent
+tool-calling.
+
+### Installation
+
+The CLI is included in the base install (typer is a core dependency):
+
+```bash
+pip install bigquery-agent-analytics
+```
+
+### Global Options
+
+Every command accepts:
+
+| Option | Env Var | Default | Description |
+|--------|---------|---------|-------------|
+| `--project-id` | `BQ_AGENT_PROJECT` | *required* | GCP project ID |
+| `--dataset-id` | `BQ_AGENT_DATASET` | *required* | BigQuery dataset |
+| `--table-id` | | `agent_events` | Events table name |
+| `--location` | | `us-central1` | BQ location |
+| `--format` | | `json` | Output format: `json\|text\|table` |
+
+### Commands
+
+#### `doctor` — Health Check
+
+```bash
+bq-agent-sdk doctor --project-id=P --dataset-id=D
+```
+
+#### `get-trace` — Retrieve a Trace
+
+```bash
+bq-agent-sdk get-trace --project-id=P --dataset-id=D --session-id=S
+bq-agent-sdk get-trace --project-id=P --dataset-id=D --trace-id=T
+```
+
+#### `evaluate` — Run Evaluations
+
+```bash
+# Code evaluator with SDK default threshold
+bq-agent-sdk evaluate --project-id=P --dataset-id=D --evaluator=latency
+
+# With explicit threshold and filters
+bq-agent-sdk evaluate --project-id=P --dataset-id=D \
+  --evaluator=error_rate --threshold=0.1 --agent-id=bot --last=24h
+
+# LLM judge
+bq-agent-sdk evaluate --project-id=P --dataset-id=D \
+  --evaluator=llm-judge --criterion=correctness --threshold=0.7
+
+# CI gate: exit code 1 on failure
+bq-agent-sdk evaluate --project-id=P --dataset-id=D \
+  --evaluator=latency --exit-code
+```
+
+Available evaluators: `latency`, `error_rate`, `turn_count`,
+`token_efficiency`, `ttft`, `cost`, `llm-judge`.
+
+LLM judge criteria: `correctness`, `hallucination`, `sentiment`.
+
+#### `insights` — Generate Insights Report
+
+```bash
+bq-agent-sdk insights --project-id=P --dataset-id=D \
+  --agent-id=bot --last=7d --max-sessions=50
+```
+
+#### `drift` — Detect Question Drift
+
+```bash
+bq-agent-sdk drift --project-id=P --dataset-id=D \
+  --golden-dataset=golden_questions
+```
+
+#### `distribution` — Question Distribution Analysis
+
+```bash
+bq-agent-sdk distribution --project-id=P --dataset-id=D \
+  --mode=auto_group_using_semantics --top-k=20
+```
+
+#### `hitl-metrics` — Human-in-the-Loop Metrics
+
+```bash
+bq-agent-sdk hitl-metrics --project-id=P --dataset-id=D --last=7d
+```
+
+#### `list-traces` — List Traces
+
+```bash
+bq-agent-sdk list-traces --project-id=P --dataset-id=D \
+  --agent-id=bot --last=1h --limit=10
+```
+
+#### `views create-all` — Create Event Views
+
+```bash
+bq-agent-sdk views create-all --project-id=P --dataset-id=D --prefix=adk_
+```
+
+#### `views create` — Create a Single View
+
+```bash
+bq-agent-sdk views create LLM_REQUEST --project-id=P --dataset-id=D
+```
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success (or evaluation passed with `--exit-code`) |
+| 1 | Evaluation failed (only with `--exit-code`) |
+| 2 | Infrastructure error (connection, auth, bad input) |
+
+---
+
+## 19. Remote Function (BigQuery SQL Interface)
+
+Deploy the SDK as a BigQuery Remote Function to call analytics
+operations directly from SQL.
+
+### Architecture
+
+```
+BigQuery SQL
+  └── SELECT agent_analytics('analyze', JSON'{"session_id":"s1"}')
+        └── REMOTE WITH CONNECTION
+              └── Cloud Function (gen2)
+                    └── SDK Client (local wheel)
+```
+
+### Deployment
+
+```bash
+cd deploy/remote_function
+./deploy.sh PROJECT [FUNCTION_REGION] [DATASET] [BQ_LOCATION]
+```
+
+The script:
+1. Builds the SDK wheel from the repo working tree
+2. Stages a deployment bundle with the wheel + runtime deps
+3. Deploys a gen2 Cloud Function
+4. Creates a BQ `CLOUD_RESOURCE` connection
+5. Grants invoker access to the connection service account
+6. Prints the `CREATE FUNCTION` DDL
+
+### Supported Operations
+
+```sql
+-- Analyze a session trace
+SELECT agent_analytics('analyze', JSON'{"session_id": "s1"}');
+
+-- Run a code evaluator
+SELECT agent_analytics('evaluate', JSON'{
+  "metric": "latency",
+  "threshold": 5000,
+  "agent_filter": "bot",
+  "last": "24h"
+}');
+
+-- Run an LLM judge
+SELECT agent_analytics('judge', JSON'{
+  "criterion": "correctness",
+  "threshold": 0.7
+}');
+
+-- Generate insights
+SELECT agent_analytics('insights', JSON'{"last": "7d"}');
+
+-- Detect drift
+SELECT agent_analytics('drift', JSON'{
+  "golden_dataset": "golden_questions"
+}');
+```
+
+### Partial Failure
+
+In batched calls, each row is processed independently. A failed row
+returns a per-row `_error` object; other rows succeed normally:
+
+```json
+{"_error": {"code": "ValueError", "message": "..."}, "_version": "1.0"}
+```
+
+### Configuration
+
+The function reads config from `userDefinedContext` (set via
+`CREATE FUNCTION` options) with environment variable fallback:
+
+| Key | Env Var | Description |
+|-----|---------|-------------|
+| `project_id` | `BQ_AGENT_PROJECT` | GCP project |
+| `dataset_id` | `BQ_AGENT_DATASET` | BQ dataset |
+| `table_id` | `BQ_AGENT_TABLE` | Events table |
+| `location` | `BQ_AGENT_LOCATION` | BQ location |
+| `endpoint` | `BQ_AGENT_ENDPOINT` | AI.GENERATE endpoint |
+| `connection_id` | `BQ_AGENT_CONNECTION_ID` | BQ connection for AI |
+
+---
+
+## 20. Continuous Queries (Real-Time Streaming)
+
+Pre-built SQL templates for BigQuery continuous queries that process
+agent events in real time as they arrive.
+
+### Prerequisites
+
+- BigQuery Enterprise reservation (see `deploy/continuous_queries/setup_reservation.md`)
+- Sink targets (tables, Pub/Sub topics, or Bigtable instances)
+
+### Available Templates
+
+| Template | Sink | Description |
+|----------|------|-------------|
+| `realtime_error_analysis.sql` | Table | Classifies errors via AI.GENERATE_TEXT |
+| `session_scoring.sql` | Table | Per-event session metrics with boolean flags |
+| `pubsub_alerting.sql` | Pub/Sub | Critical error alerting |
+| `bigtable_dashboard.sql` | Bigtable | Low-latency dashboard metrics |
+
+### Usage
+
+1. Create sink resources (tables, topics) using the one-time DDL in each
+   template's header comments
+2. Replace placeholders (`PROJECT`, `DATASET`, `CONNECTION`, etc.)
+3. Start the continuous query:
+
+```bash
+bq query --use_legacy_sql=false --continuous=true \
+  < deploy/continuous_queries/session_scoring.sql
+```
+
+### Design Constraints
+
+BigQuery continuous queries operate on `APPENDS()` (new rows only)
+and do not support `GROUP BY`, aggregation, or DDL. All templates
+emit per-event rows; downstream dashboards or scheduled queries
+handle aggregation.
+
+---
+
 ## Module Architecture
 
 ```
@@ -1453,9 +1698,18 @@ bigquery_agent_analytics/
 │   Context Graph
 │   └── context_graph.py       ← Property Graph, BizNode extraction, GQL, world-change
 │
+│   CLI & Interfaces
+│   ├── cli.py                 ← typer CLI (bq-agent-sdk)
+│   ├── formatter.py           ← Output formatting (json/text/table)
+│   └── serialization.py       ← Uniform serialization layer
+│
 │   Utilities
 │   ├── event_semantics.py     ← Canonical event type helpers & predicates
 │   └── views.py               ← Per-event-type BigQuery view management
+│
+│   Deployment
+│   ├── deploy/remote_function/  ← BigQuery Remote Function
+│   └── deploy/continuous_queries/ ← Continuous query templates
 ```
 
 ### Dependency Graph
