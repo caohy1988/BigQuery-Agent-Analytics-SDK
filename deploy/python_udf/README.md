@@ -58,19 +58,12 @@ sql = generate_udf("bqaa_score_latency", "my-project", "analytics")
 
 All score kernels return a value in `[0.0, 1.0]` where 1.0 is best.
 
-### Tier 3: Vectorized UDFs
+### Tier 3: Vectorized UDFs (Deferred)
 
-Vectorized UDFs (`OPTIONS vectorized = true`) process rows in batches
-using numpy/pandas.  Use these instead of scalar equivalents on large
-result sets (>10K rows) for better throughput.  The SQL call-site is
-identical — BigQuery handles the batching transparently.
-
-| Function | Params | Returns | Description |
-|----------|--------|---------|-------------|
-| `bqaa_score_latency_batch` | `avg_latency_ms, threshold_ms` | `FLOAT64` | Vectorized latency scoring |
-| `bqaa_score_error_rate_batch` | `tool_calls, tool_errors, max_error_rate` | `FLOAT64` | Vectorized error rate scoring |
-| `bqaa_score_cost_batch` | `input_tokens, output_tokens, max_cost_usd, input_cost_per_1k, output_cost_per_1k` | `FLOAT64` | Vectorized cost scoring |
-| `bqaa_normalize_event_label` | `event_type` | `STRING` | Event type normalization |
+Vectorized Python UDFs (`OPTIONS(vectorized = true)`) are deferred
+until BigQuery adds `vectorized` option support for Python UDFs.  The
+option is currently only supported for JavaScript UDFs.  When support
+lands, batch-oriented scoring UDFs using numpy/pandas will be added.
 
 ## Region Guidance
 
@@ -84,5 +77,3 @@ a shared utility dataset.
   Session scoring with SQL pre-aggregation + UDF score kernels
 - [python_udf_event_semantics.sql](../../examples/python_udf_event_semantics.sql) —
   Event classification and response extraction
-- [python_udf_vectorized.sql](../../examples/python_udf_vectorized.sql) —
-  Batch scoring and event normalization with vectorized UDFs
