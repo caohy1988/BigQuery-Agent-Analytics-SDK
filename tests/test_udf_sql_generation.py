@@ -403,44 +403,63 @@ class TestVectorizedBodyParity:
     from bigquery_agent_analytics.udf_kernels import score_latency
 
     fn = self._exec_vectorized_udf("bqaa_score_latency_batch")
-    avgs = pd.Series([0, 2500, 5000, 10000, -1], dtype=float)
-    thresholds = pd.Series([5000.0] * 5)
-    result = fn(avgs, thresholds)
-    for i, (a, t) in enumerate(zip(avgs, thresholds)):
+    df = pd.DataFrame(
+        {
+            "avg_latency_ms": [0.0, 2500.0, 5000.0, 10000.0, -1.0],
+            "threshold_ms": [5000.0] * 5,
+        }
+    )
+    result = fn(df)
+    assert isinstance(result, pd.Series), "Must return pd.Series"
+    for i in range(len(df)):
       assert result[i] == pytest.approx(
-          score_latency(a, t)
-      ), f"Mismatch at index {i}: avg={a}, thresh={t}"
+          score_latency(df["avg_latency_ms"][i], df["threshold_ms"][i])
+      ), f"Mismatch at index {i}"
 
   def test_score_error_rate_batch_parity(self):
     from bigquery_agent_analytics.udf_kernels import score_error_rate
 
     fn = self._exec_vectorized_udf("bqaa_score_error_rate_batch")
-    calls = pd.Series([0, 10, 10, 100, 5], dtype=np.int64)
-    errors = pd.Series([0, 0, 1, 5, 5], dtype=np.int64)
-    max_rates = pd.Series([0.1] * 5)
-    result = fn(calls, errors, max_rates)
-    for i in range(len(calls)):
+    df = pd.DataFrame(
+        {
+            "tool_calls": pd.array([0, 10, 10, 100, 5], dtype=np.int64),
+            "tool_errors": pd.array([0, 0, 1, 5, 5], dtype=np.int64),
+            "max_error_rate": [0.1] * 5,
+        }
+    )
+    result = fn(df)
+    assert isinstance(result, pd.Series), "Must return pd.Series"
+    for i in range(len(df)):
       assert result[i] == pytest.approx(
-          score_error_rate(calls[i], errors[i], max_rates[i])
+          score_error_rate(
+              df["tool_calls"][i],
+              df["tool_errors"][i],
+              df["max_error_rate"][i],
+          )
       ), f"Mismatch at index {i}"
 
   def test_score_cost_batch_parity(self):
     from bigquery_agent_analytics.udf_kernels import score_cost
 
     fn = self._exec_vectorized_udf("bqaa_score_cost_batch")
-    inp = pd.Series([0, 10000, 1000], dtype=np.int64)
-    out = pd.Series([0, 10000, 1000], dtype=np.int64)
-    max_cost = pd.Series([1.0, 1.0, 0.01])
-    icost = pd.Series([0.00025, 0.00025, 0.001])
-    ocost = pd.Series([0.00125, 0.00125, 0.002])
-    result = fn(inp, out, max_cost, icost, ocost)
-    for i in range(len(inp)):
+    df = pd.DataFrame(
+        {
+            "input_tokens": pd.array([0, 10000, 1000], dtype=np.int64),
+            "output_tokens": pd.array([0, 10000, 1000], dtype=np.int64),
+            "max_cost_usd": [1.0, 1.0, 0.01],
+            "input_cost_per_1k": [0.00025, 0.00025, 0.001],
+            "output_cost_per_1k": [0.00125, 0.00125, 0.002],
+        }
+    )
+    result = fn(df)
+    assert isinstance(result, pd.Series), "Must return pd.Series"
+    for i in range(len(df)):
       expected = score_cost(
-          inp[i],
-          out[i],
-          max_cost[i],
-          icost[i],
-          ocost[i],
+          df["input_tokens"][i],
+          df["output_tokens"][i],
+          df["max_cost_usd"][i],
+          df["input_cost_per_1k"][i],
+          df["output_cost_per_1k"][i],
       )
       assert result[i] == pytest.approx(expected), f"Mismatch at index {i}"
 
@@ -448,18 +467,21 @@ class TestVectorizedBodyParity:
     from bigquery_agent_analytics.udf_kernels import normalize_event_label
 
     fn = self._exec_vectorized_udf("bqaa_normalize_event_label")
-    events = pd.Series(
-        [
-            "LLM_REQUEST",
-            "LLM_RESPONSE",
-            "TOOL_STARTING",
-            "TOOL_COMPLETED",
-            "TOOL_ERROR",
-            "USER_MESSAGE_RECEIVED",
-            "AGENT_COMPLETED",
-            "UNKNOWN_EVENT",
-        ]
+    df = pd.DataFrame(
+        {
+            "event_type": [
+                "LLM_REQUEST",
+                "LLM_RESPONSE",
+                "TOOL_STARTING",
+                "TOOL_COMPLETED",
+                "TOOL_ERROR",
+                "USER_MESSAGE_RECEIVED",
+                "AGENT_COMPLETED",
+                "UNKNOWN_EVENT",
+            ]
+        }
     )
-    result = fn(events)
-    for i, ev in enumerate(events):
+    result = fn(df)
+    assert isinstance(result, pd.Series), "Must return pd.Series"
+    for i, ev in enumerate(df["event_type"]):
       assert result[i] == normalize_event_label(ev), f"Mismatch for {ev}"

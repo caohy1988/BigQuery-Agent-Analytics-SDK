@@ -255,12 +255,15 @@ _SCORE_LATENCY_BATCH = _UdfSpec(
     body=textwrap.dedent(
         """\
         import numpy as np
+        import pandas as pd
 
-        def bqaa_score_latency_batch(avg_latency_ms, threshold_ms):
-            score = 1.0 - (avg_latency_ms / threshold_ms)
-            score = np.where(avg_latency_ms <= 0, 1.0, score)
-            score = np.where(avg_latency_ms >= threshold_ms, 0.0, score)
-            return score
+        def bqaa_score_latency_batch(df: pd.DataFrame) -> pd.Series:
+            avg = df["avg_latency_ms"]
+            thresh = df["threshold_ms"]
+            score = 1.0 - (avg / thresh)
+            score = np.where(avg <= 0, 1.0, score)
+            score = np.where(avg >= thresh, 0.0, score)
+            return pd.Series(score)
     """
     ),
 )
@@ -277,15 +280,18 @@ _SCORE_ERROR_RATE_BATCH = _UdfSpec(
     body=textwrap.dedent(
         """\
         import numpy as np
+        import pandas as pd
 
-        def bqaa_score_error_rate_batch(tool_calls, tool_errors,
-                                        max_error_rate):
-            safe_calls = np.where(tool_calls > 0, tool_calls, 1)
-            rate = tool_errors / safe_calls
-            score = 1.0 - (rate / max_error_rate)
-            score = np.where(tool_calls <= 0, 1.0, score)
-            score = np.where(rate >= max_error_rate, 0.0, score)
-            return score
+        def bqaa_score_error_rate_batch(df: pd.DataFrame) -> pd.Series:
+            calls = df["tool_calls"]
+            errs = df["tool_errors"]
+            max_rate = df["max_error_rate"]
+            safe_calls = np.where(calls > 0, calls, 1)
+            rate = errs / safe_calls
+            score = 1.0 - (rate / max_rate)
+            score = np.where(calls <= 0, 1.0, score)
+            score = np.where(rate >= max_rate, 0.0, score)
+            return pd.Series(score)
     """
     ),
 )
@@ -306,16 +312,19 @@ _SCORE_COST_BATCH = _UdfSpec(
     body=textwrap.dedent(
         """\
         import numpy as np
+        import pandas as pd
 
-        def bqaa_score_cost_batch(input_tokens, output_tokens,
-                                  max_cost_usd, input_cost_per_1k,
-                                  output_cost_per_1k):
-            cost = ((input_tokens / 1000) * input_cost_per_1k
-                    + (output_tokens / 1000) * output_cost_per_1k)
-            score = 1.0 - (cost / max_cost_usd)
+        def bqaa_score_cost_batch(df: pd.DataFrame) -> pd.Series:
+            inp = df["input_tokens"]
+            out = df["output_tokens"]
+            max_c = df["max_cost_usd"]
+            ic = df["input_cost_per_1k"]
+            oc = df["output_cost_per_1k"]
+            cost = (inp / 1000) * ic + (out / 1000) * oc
+            score = 1.0 - (cost / max_c)
             score = np.where(cost <= 0, 1.0, score)
-            score = np.where(cost >= max_cost_usd, 0.0, score)
-            return score
+            score = np.where(cost >= max_c, 0.0, score)
+            return pd.Series(score)
     """
     ),
 )
@@ -331,7 +340,9 @@ _NORMALIZE_EVENT_LABEL = _UdfSpec(
     vectorized=True,
     body=textwrap.dedent(
         """\
-        def bqaa_normalize_event_label(event_type):
+        import pandas as pd
+
+        def bqaa_normalize_event_label(df: pd.DataFrame) -> pd.Series:
             mapping = {
                 "LLM_REQUEST": "llm",
                 "LLM_RESPONSE": "llm",
@@ -341,7 +352,7 @@ _NORMALIZE_EVENT_LABEL = _UdfSpec(
                 "USER_MESSAGE_RECEIVED": "user",
                 "AGENT_COMPLETED": "agent",
             }
-            return event_type.map(mapping).fillna("other")
+            return df["event_type"].map(mapping).fillna("other")
     """
     ),
 )
