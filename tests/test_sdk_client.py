@@ -21,11 +21,9 @@ from unittest.mock import patch
 
 import pytest
 
-from bigquery_agent_analytics.categorical_evaluator import (
-    CategoricalEvaluationConfig,
-    CategoricalMetricCategory,
-    CategoricalMetricDefinition,
-)
+from bigquery_agent_analytics.categorical_evaluator import CategoricalEvaluationConfig
+from bigquery_agent_analytics.categorical_evaluator import CategoricalMetricCategory
+from bigquery_agent_analytics.categorical_evaluator import CategoricalMetricDefinition
 from bigquery_agent_analytics.client import Client
 from bigquery_agent_analytics.evaluators import CodeEvaluator
 from bigquery_agent_analytics.evaluators import EvaluationReport
@@ -1038,7 +1036,9 @@ def _make_categorical_config(**overrides):
               name="tone",
               definition="Tone.",
               categories=[
-                  CategoricalMetricCategory(name="positive", definition="Good."),
+                  CategoricalMetricCategory(
+                      name="positive", definition="Good."
+                  ),
                   CategoricalMetricCategory(name="negative", definition="Bad."),
               ],
           ),
@@ -1145,7 +1145,8 @@ class TestEvaluateCategoricalDataset:
     )
     config = _make_categorical_config()
     report = client.evaluate_categorical(
-        config=config, dataset="custom_events",
+        config=config,
+        dataset="custom_events",
     )
     assert "custom_events" in report.dataset
 

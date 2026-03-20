@@ -18,20 +18,17 @@ import json
 
 import pytest
 
-from bigquery_agent_analytics.categorical_evaluator import (
-    build_categorical_prompt,
-    build_categorical_report,
-    CATEGORICAL_AI_GENERATE_QUERY,
-    CategoricalEvaluationConfig,
-    CategoricalEvaluationReport,
-    CategoricalMetricCategory,
-    CategoricalMetricDefinition,
-    CategoricalMetricResult,
-    CategoricalSessionResult,
-    parse_categorical_row,
-    parse_classifications,
-)
-
+from bigquery_agent_analytics.categorical_evaluator import build_categorical_prompt
+from bigquery_agent_analytics.categorical_evaluator import build_categorical_report
+from bigquery_agent_analytics.categorical_evaluator import CATEGORICAL_AI_GENERATE_QUERY
+from bigquery_agent_analytics.categorical_evaluator import CategoricalEvaluationConfig
+from bigquery_agent_analytics.categorical_evaluator import CategoricalEvaluationReport
+from bigquery_agent_analytics.categorical_evaluator import CategoricalMetricCategory
+from bigquery_agent_analytics.categorical_evaluator import CategoricalMetricDefinition
+from bigquery_agent_analytics.categorical_evaluator import CategoricalMetricResult
+from bigquery_agent_analytics.categorical_evaluator import CategoricalSessionResult
+from bigquery_agent_analytics.categorical_evaluator import parse_categorical_row
+from bigquery_agent_analytics.categorical_evaluator import parse_classifications
 
 # ------------------------------------------------------------------ #
 # Helpers                                                              #
@@ -176,9 +173,7 @@ class TestBuildCategoricalPrompt:
     assert example[0]["metric_name"] == "tone"
 
   def test_no_justification(self):
-    prompt = build_categorical_prompt(
-        _make_config(include_justification=False)
-    )
+    prompt = build_categorical_prompt(_make_config(include_justification=False))
     assert "Do not include" in prompt
     # The output spec after the instruction lines should not list
     # justification as a required field.
@@ -197,10 +192,20 @@ class TestParseClassifications:
 
   def test_valid_json(self):
     config = _make_config()
-    raw = json.dumps([
-        {"metric_name": "tone", "category": "positive", "justification": "kind"},
-        {"metric_name": "safety", "category": "safe", "justification": "ok"},
-    ])
+    raw = json.dumps(
+        [
+            {
+                "metric_name": "tone",
+                "category": "positive",
+                "justification": "kind",
+            },
+            {
+                "metric_name": "safety",
+                "category": "safe",
+                "justification": "ok",
+            },
+        ]
+    )
     results = parse_classifications(raw, config)
     assert len(results) == 2
     assert results[0].metric_name == "tone"
@@ -213,10 +218,12 @@ class TestParseClassifications:
 
   def test_invalid_category(self):
     config = _make_config()
-    raw = json.dumps([
-        {"metric_name": "tone", "category": "unknown_val"},
-        {"metric_name": "safety", "category": "safe"},
-    ])
+    raw = json.dumps(
+        [
+            {"metric_name": "tone", "category": "unknown_val"},
+            {"metric_name": "safety", "category": "safe"},
+        ]
+    )
     results = parse_classifications(raw, config)
     tone = results[0]
     assert tone.parse_error is True
@@ -227,9 +234,11 @@ class TestParseClassifications:
 
   def test_missing_metric(self):
     config = _make_config()
-    raw = json.dumps([
-        {"metric_name": "tone", "category": "positive"},
-    ])
+    raw = json.dumps(
+        [
+            {"metric_name": "tone", "category": "positive"},
+        ]
+    )
     results = parse_classifications(raw, config)
     assert len(results) == 2
     safety = results[1]
@@ -258,10 +267,12 @@ class TestParseClassifications:
 
   def test_case_insensitive(self):
     config = _make_config()
-    raw = json.dumps([
-        {"metric_name": "tone", "category": "POSITIVE"},
-        {"metric_name": "safety", "category": "Safe"},
-    ])
+    raw = json.dumps(
+        [
+            {"metric_name": "tone", "category": "POSITIVE"},
+            {"metric_name": "safety", "category": "Safe"},
+        ]
+    )
     results = parse_classifications(raw, config)
     assert results[0].category == "positive"
     assert results[0].passed_validation is True
@@ -270,31 +281,37 @@ class TestParseClassifications:
 
   def test_extra_whitespace(self):
     config = _make_config()
-    raw = json.dumps([
-        {"metric_name": "tone", "category": "  positive  "},
-        {"metric_name": "safety", "category": "safe"},
-    ])
+    raw = json.dumps(
+        [
+            {"metric_name": "tone", "category": "  positive  "},
+            {"metric_name": "safety", "category": "safe"},
+        ]
+    )
     results = parse_classifications(raw, config)
     assert results[0].category == "positive"
     assert results[0].passed_validation is True
 
   def test_unknown_metric_ignored(self):
     config = _make_config()
-    raw = json.dumps([
-        {"metric_name": "tone", "category": "positive"},
-        {"metric_name": "safety", "category": "safe"},
-        {"metric_name": "bogus", "category": "whatever"},
-    ])
+    raw = json.dumps(
+        [
+            {"metric_name": "tone", "category": "positive"},
+            {"metric_name": "safety", "category": "safe"},
+            {"metric_name": "bogus", "category": "whatever"},
+        ]
+    )
     results = parse_classifications(raw, config)
     assert len(results) == 2
 
   def test_duplicate_metric_flagged_as_error(self):
     config = _make_config()
-    raw = json.dumps([
-        {"metric_name": "tone", "category": "positive"},
-        {"metric_name": "tone", "category": "negative"},
-        {"metric_name": "safety", "category": "safe"},
-    ])
+    raw = json.dumps(
+        [
+            {"metric_name": "tone", "category": "positive"},
+            {"metric_name": "tone", "category": "negative"},
+            {"metric_name": "safety", "category": "safe"},
+        ]
+    )
     results = parse_classifications(raw, config)
     tone = results[0]
     assert tone.parse_error is True
@@ -321,9 +338,7 @@ class TestParseClassifications:
             ),
         ],
     )
-    raw = json.dumps(
-        {"metric_name": "tone", "category": "positive"}
-    )
+    raw = json.dumps({"metric_name": "tone", "category": "positive"})
     results = parse_classifications(raw, config)
     assert len(results) == 1
     assert results[0].category == "positive"
@@ -339,10 +354,12 @@ class TestParseCategoricalRow:
 
   def test_valid_row(self):
     config = _make_config()
-    raw = json.dumps([
-        {"metric_name": "tone", "category": "positive"},
-        {"metric_name": "safety", "category": "safe"},
-    ])
+    raw = json.dumps(
+        [
+            {"metric_name": "tone", "category": "positive"},
+            {"metric_name": "safety", "category": "safe"},
+        ]
+    )
     row = {
         "session_id": "s1",
         "transcript": "some text",
@@ -379,9 +396,7 @@ class TestBuildCategoricalReport:
                 CategoricalMetricResult(
                     metric_name="tone", category="positive"
                 ),
-                CategoricalMetricResult(
-                    metric_name="safety", category="safe"
-                ),
+                CategoricalMetricResult(metric_name="safety", category="safe"),
             ],
         ),
         CategoricalSessionResult(
@@ -401,9 +416,7 @@ class TestBuildCategoricalReport:
                 CategoricalMetricResult(
                     metric_name="tone", category="negative"
                 ),
-                CategoricalMetricResult(
-                    metric_name="safety", category="safe"
-                ),
+                CategoricalMetricResult(metric_name="safety", category="safe"),
             ],
         ),
     ]
@@ -456,9 +469,7 @@ class TestBuildCategoricalReport:
                 CategoricalMetricResult(
                     metric_name="tone", category="positive"
                 ),
-                CategoricalMetricResult(
-                    metric_name="safety", category="safe"
-                ),
+                CategoricalMetricResult(metric_name="safety", category="safe"),
             ],
         ),
     ]

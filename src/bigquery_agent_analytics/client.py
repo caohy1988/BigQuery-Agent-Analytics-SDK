@@ -1192,9 +1192,7 @@ class Client:
     # When config uses the default, fall back to client.endpoint —
     # but guard against legacy BQML model refs which are incompatible
     # with AI.GENERATE.
-    _default_ep = CategoricalEvaluationConfig.model_fields[
-        "endpoint"
-    ].default
+    _default_ep = CategoricalEvaluationConfig.model_fields["endpoint"].default
     if config.endpoint != _default_ep:
       endpoint = config.endpoint
     elif self._is_legacy_model_ref(self.endpoint):
@@ -1215,16 +1213,16 @@ class Client:
 
     query_params = list(params) + [
         bigquery.ScalarQueryParameter(
-            "categorical_prompt", "STRING", prompt,
+            "categorical_prompt",
+            "STRING",
+            prompt,
         ),
     ]
     job_config = bigquery.QueryJobConfig(
         query_parameters=query_params,
     )
 
-    results = list(
-        self.bq_client.query(query, job_config=job_config).result()
-    )
+    results = list(self.bq_client.query(query, job_config=job_config).result())
 
     session_results = []
     for row in results:

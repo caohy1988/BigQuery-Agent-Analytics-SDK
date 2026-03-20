@@ -278,20 +278,24 @@ def build_categorical_prompt(
         'Do not include a "justification" field in your response.'
     )
 
-  lines.extend([
-      justification_note,
-      "",
-      "Respond with ONLY a valid JSON array. Each element must have:",
-      '  - "metric_name": the metric name exactly as shown above',
-      '  - "category": one of the allowed categories exactly as shown above',
-  ])
+  lines.extend(
+      [
+          justification_note,
+          "",
+          "Respond with ONLY a valid JSON array. Each element must have:",
+          '  - "metric_name": the metric name exactly as shown above',
+          '  - "category": one of the allowed categories exactly as shown above',
+      ]
+  )
   if config.include_justification:
     lines.append('  - "justification": a brief explanation')
 
-  lines.extend([
-      "",
-      "Example output format:",
-  ])
+  lines.extend(
+      [
+          "",
+          "Example output format:",
+      ]
+  )
   example = []
   for metric in config.metrics:
     entry: dict[str, str] = {
@@ -493,8 +497,7 @@ def build_categorical_report(
       dataset=dataset,
       total_sessions=len(session_results),
       category_distributions={
-          name: dict(counter)
-          for name, counter in distributions.items()
+          name: dict(counter) for name, counter in distributions.items()
       },
       details={
           "parse_errors": parse_error_count,
