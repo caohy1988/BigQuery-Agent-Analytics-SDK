@@ -15,7 +15,8 @@
 -- BigQuery Python UDF registration for Agent Analytics SDK.
 --
 -- This file registers all Tier 1 (event semantics) and Tier 2 (score
--- kernel) UDFs.  Each UDF inlines its kernel body so there are no
+-- kernel) UDFs.  Each UDF inlines its
+-- kernel body so there are no
 -- external dependencies — no pip install, no Cloud Function.
 --
 -- Prerequisites:

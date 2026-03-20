@@ -25,6 +25,8 @@ from bigquery_agent_analytics.udf_sql_templates import UDF_NAMES
 PROJECT = "test-project"
 DATASET = "analytics"
 
+TOTAL_UDFS = 9  # 3 Tier 1 + 6 Tier 2
+
 
 # ------------------------------------------------------------------ #
 # Registry                                                             #
@@ -34,10 +36,10 @@ DATASET = "analytics"
 class TestRegistry:
 
   def test_all_udfs_count(self):
-    assert len(ALL_UDFS) == 9
+    assert len(ALL_UDFS) == TOTAL_UDFS
 
   def test_udf_names_count(self):
-    assert len(UDF_NAMES) == 9
+    assert len(UDF_NAMES) == TOTAL_UDFS
 
   def test_names_unique(self):
     assert len(set(UDF_NAMES)) == len(UDF_NAMES)
@@ -144,9 +146,9 @@ class TestGenerateAllUdfs:
     for name in UDF_NAMES:
       assert f".{name}`" in sql, f"Missing UDF: {name}"
 
-  def test_nine_create_statements(self):
+  def test_total_create_statements(self):
     sql = generate_all_udfs(PROJECT, DATASET)
-    assert sql.count("CREATE OR REPLACE FUNCTION") == 9
+    assert sql.count("CREATE OR REPLACE FUNCTION") == TOTAL_UDFS
 
   def test_custom_separator(self):
     sql = generate_all_udfs(PROJECT, DATASET, separator="\n---\n")
@@ -168,7 +170,7 @@ class TestListUdfs:
   def test_returns_list(self):
     result = list_udfs()
     assert isinstance(result, list)
-    assert len(result) == 9
+    assert len(result) == TOTAL_UDFS
 
   def test_dict_keys(self):
     for entry in list_udfs():

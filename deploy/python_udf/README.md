@@ -58,6 +58,13 @@ sql = generate_udf("bqaa_score_latency", "my-project", "analytics")
 
 All score kernels return a value in `[0.0, 1.0]` where 1.0 is best.
 
+### Tier 3: Vectorized UDFs (Deferred)
+
+Vectorized Python UDFs (`OPTIONS(vectorized = true)`) are deferred
+until BigQuery adds `vectorized` option support for Python UDFs.  The
+option is currently only supported for JavaScript UDFs.  When support
+lands, batch-oriented scoring UDFs using numpy/pandas will be added.
+
 ## Region Guidance
 
 BigQuery UDFs are region-scoped. If your data lives in multiple
