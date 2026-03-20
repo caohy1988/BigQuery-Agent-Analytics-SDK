@@ -130,6 +130,7 @@ class CategoricalEvaluationConfig(BaseModel):
 
 ```python
 from datetime import datetime
+from datetime import timezone
 from typing import Any, Optional
 
 from pydantic import BaseModel
@@ -161,7 +162,9 @@ class CategoricalEvaluationReport(BaseModel):
     )
     details: dict[str, Any] = Field(default_factory=dict)
     session_results: list[CategoricalSessionResult] = Field(default_factory=list)
-    created_at: datetime
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+    )
 ```
 
 ### New client method
@@ -169,7 +172,7 @@ class CategoricalEvaluationReport(BaseModel):
 ```python
 report = client.evaluate_categorical(
     config=config,
-    filters=TraceFilter(last="24h"),
+    filters=TraceFilter.from_cli_args(last="24h"),
     dataset="agent_events",
 )
 ```
