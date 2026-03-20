@@ -223,17 +223,16 @@ WITH session_transcripts AS (
 SELECT
   session_id,
   transcript,
-  result.*
-FROM session_transcripts,
-AI.GENERATE(
-  prompt => CONCAT(
-    @categorical_prompt,
-    '\\n\\nTranscript:\\n', transcript
-  ),
-  endpoint => '{endpoint}',
-  model_params => JSON '{{"temperature": {temperature}, "max_output_tokens": 1024}}',
-  output_schema => 'classifications STRING'
-) AS result
+  (AI.GENERATE(
+    CONCAT(
+      @categorical_prompt,
+      '\\n\\nTranscript:\\n', transcript
+    ),
+    endpoint => '{endpoint}',
+    model_params => JSON '{{"generationConfig": {{"temperature": {temperature}, "maxOutputTokens": 1024}}}}',
+    output_schema => 'classifications STRING'
+  )).classifications AS classifications
+FROM session_transcripts
 """
 
 
