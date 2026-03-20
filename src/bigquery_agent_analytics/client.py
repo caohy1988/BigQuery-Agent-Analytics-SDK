@@ -1188,14 +1188,19 @@ class Client:
     filt = filters or TraceFilter()
     where, params = filt.to_sql_conditions()
 
-    # Endpoint precedence: config overrides client when explicitly set.
-    endpoint = (
-        config.endpoint
-        if config.endpoint != CategoricalEvaluationConfig.model_fields[
-            "endpoint"
-        ].default
-        else self.endpoint
-    )
+    # Endpoint precedence: config.endpoint wins when explicitly set.
+    # When config uses the default, fall back to client.endpoint —
+    # but guard against legacy BQML model refs which are incompatible
+    # with AI.GENERATE.
+    _default_ep = CategoricalEvaluationConfig.model_fields[
+        "endpoint"
+    ].default
+    if config.endpoint != _default_ep:
+      endpoint = config.endpoint
+    elif self._is_legacy_model_ref(self.endpoint):
+      endpoint = _default_ep
+    else:
+      endpoint = self.endpoint
 
     prompt = build_categorical_prompt(config)
 
@@ -1227,8 +1232,9 @@ class Client:
       sid = r.get("session_id", "unknown")
       session_results.append(parse_categorical_row(sid, r, config))
 
+    table_ref = f"{self.project_id}.{self.dataset_id}.{table}"
     return build_categorical_report(
-        dataset=f"{self._table_ref} WHERE {where}",
+        dataset=f"{table_ref} WHERE {where}",
         session_results=session_results,
         config=config,
     )
