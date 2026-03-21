@@ -1230,21 +1230,33 @@ class Client:
       fallback_reason = str(e)
 
     # Fallback: Gemini API.
-    session_results = self._categorical_api_fallback(
-        config,
-        table,
-        where,
-        params,
-        endpoint,
-    )
-    report = build_categorical_report(
-        dataset=f"{table_ref} WHERE {where}",
-        session_results=session_results,
-        config=config,
-    )
-    report.details["execution_mode"] = "api_fallback"
-    report.details["fallback_reason"] = fallback_reason
-    return report
+    try:
+      session_results = self._categorical_api_fallback(
+          config,
+          table,
+          where,
+          params,
+          endpoint,
+      )
+      report = build_categorical_report(
+          dataset=f"{table_ref} WHERE {where}",
+          session_results=session_results,
+          config=config,
+      )
+      report.details["execution_mode"] = "api_fallback"
+      report.details["fallback_reason"] = fallback_reason
+      return report
+    except ImportError:
+      # google-genai not installed — API fallback is unavailable.
+      report = build_categorical_report(
+          dataset=f"{table_ref} WHERE {where}",
+          session_results=[],
+          config=config,
+      )
+      report.details["execution_mode"] = "api_unavailable"
+      report.details["fallback_reason"] = fallback_reason
+      report.details["api_error"] = "google-genai not installed"
+      return report
 
   def _categorical_ai_generate(
       self,

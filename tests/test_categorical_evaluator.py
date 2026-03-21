@@ -684,16 +684,15 @@ class TestClassifySessionsViaApi:
     # Second session should have parse errors.
     assert all(m.parse_error for m in results[1].metrics)
 
-  def test_import_error_returns_parse_errors(self):
-    """When google-genai is not installed, all sessions should get
-    parse errors."""
+  def test_import_error_propagates(self):
+    """When google-genai is not installed, ImportError should propagate
+    so the caller can set the correct execution mode."""
     config = _make_config()
     transcripts = {"s1": "transcript1"}
 
     import builtins
     import sys
 
-    # Remove google.genai from sys.modules to trigger ImportError.
     saved = {}
     for key in list(sys.modules):
       if key.startswith("google.genai") or key == "google.genai":
@@ -706,14 +705,11 @@ class TestClassifySessionsViaApi:
         raise ImportError("No module named 'google.genai'")
       return original_import(name, *args, **kwargs)
 
-    with patch.object(builtins, "__import__", side_effect=mock_import):
-      results = _run(classify_sessions_via_api(transcripts, config))
+    with pytest.raises(ImportError):
+      with patch.object(builtins, "__import__", side_effect=mock_import):
+        _run(classify_sessions_via_api(transcripts, config))
 
     sys.modules.update(saved)
-
-    assert len(results) == 1
-    assert all(m.parse_error for m in results[0].metrics)
-    assert "google-genai not installed" in results[0].metrics[0].raw_response
 
   def test_case_insensitive_api_response(self):
     """API response with mixed-case categories should normalize."""

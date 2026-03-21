@@ -610,23 +610,7 @@ async def classify_sessions_via_api(
             )
         )
   except ImportError:
-    logger.warning(
-        "google-genai not installed, returning parse errors for all sessions."
-    )
-    for sid in transcripts:
-      results.append(
-          CategoricalSessionResult(
-              session_id=sid,
-              metrics=[
-                  CategoricalMetricResult(
-                      metric_name=m.name,
-                      parse_error=True,
-                      passed_validation=False,
-                      raw_response="google-genai not installed",
-                  )
-                  for m in config.metrics
-              ],
-          )
-      )
+    logger.warning("google-genai not installed; cannot run API fallback.")
+    raise
 
   return results

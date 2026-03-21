@@ -1263,3 +1263,44 @@ class TestEvaluateCategoricalFallback:
     config = _make_categorical_config()
     report = client.evaluate_categorical(config=config)
     assert "fallback_reason" not in report.details
+
+  def test_api_unavailable_when_genai_not_installed(self):
+    """When AI.GENERATE fails and google-genai is missing, report
+    should have execution_mode='api_unavailable'."""
+    mock_bq = _mock_bq_client()
+
+    call_count = [0]
+
+    def query_side_effect(*args, **kwargs):
+      call_count[0] += 1
+      result = MagicMock()
+      if call_count[0] == 1:
+        result.result.side_effect = Exception("AI.GENERATE not available")
+      else:
+        result.result.return_value = iter(
+            [
+                {"session_id": "s1", "transcript": "USER: Hello"},
+            ]
+        )
+      return result
+
+    mock_bq.query.side_effect = query_side_effect
+
+    client = Client(
+        project_id="proj",
+        dataset_id="ds",
+        verify_schema=False,
+        bq_client=mock_bq,
+    )
+    config = _make_categorical_config()
+
+    with patch(
+        "bigquery_agent_analytics.client.classify_sessions_via_api",
+        side_effect=ImportError("No module named 'google.genai'"),
+    ):
+      report = client.evaluate_categorical(config=config)
+
+    assert report.details["execution_mode"] == "api_unavailable"
+    assert report.details["api_error"] == "google-genai not installed"
+    assert "AI.GENERATE not available" in report.details["fallback_reason"]
+    assert report.total_sessions == 0
