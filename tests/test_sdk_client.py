@@ -1304,3 +1304,239 @@ class TestEvaluateCategoricalFallback:
     assert report.details["api_error"] == "google-genai not installed"
     assert "AI.GENERATE not available" in report.details["fallback_reason"]
     assert report.total_sessions == 0
+
+
+class TestEvaluateCategoricalPersistence:
+  """Tests for persist_results flow in evaluate_categorical."""
+
+  def _make_client_with_results(self):
+    """Returns a (client, mock_bq) pair where AI.GENERATE returns
+    one session with valid classifications."""
+    import json
+
+    mock_bq = _mock_bq_client()
+    row = {
+        "session_id": "s1",
+        "transcript": "USER: Hello",
+        "classifications": json.dumps(
+            [
+                {"metric_name": "tone", "category": "positive"},
+            ]
+        ),
+    }
+    mock_bq.query.return_value.result.return_value = iter([row])
+    mock_bq.insert_rows_json.return_value = []  # no errors
+
+    client = Client(
+        project_id="proj",
+        dataset_id="ds",
+        verify_schema=False,
+        bq_client=mock_bq,
+    )
+    return client, mock_bq
+
+  def test_persist_disabled_by_default(self):
+    """When persist_results=False (default), no DDL or insert calls."""
+    client, mock_bq = self._make_client_with_results()
+    config = _make_categorical_config()
+    report = client.evaluate_categorical(config=config)
+
+    # Only one query call: the AI.GENERATE query.
+    assert mock_bq.query.call_count == 1
+    mock_bq.insert_rows_json.assert_not_called()
+    assert "persisted" not in report.details
+
+  def test_persist_creates_table_and_inserts(self):
+    """When persist_results=True, DDL and insert_rows_json are called."""
+    client, mock_bq = self._make_client_with_results()
+    # DDL query returns immediately.
+    ddl_result = MagicMock()
+    ai_result = MagicMock()
+    ai_result.result.return_value = (
+        mock_bq.query.return_value.result.return_value
+    )
+
+    import json
+
+    row = {
+        "session_id": "s1",
+        "transcript": "USER: Hello",
+        "classifications": json.dumps(
+            [
+                {"metric_name": "tone", "category": "positive"},
+            ]
+        ),
+    }
+
+    call_count = [0]
+
+    def query_side_effect(*args, **kwargs):
+      call_count[0] += 1
+      result = MagicMock()
+      if call_count[0] == 1:
+        # AI.GENERATE query.
+        result.result.return_value = iter([row])
+      else:
+        # DDL query.
+        result.result.return_value = None
+      return result
+
+    mock_bq.query.side_effect = query_side_effect
+
+    config = _make_categorical_config(
+        persist_results=True,
+        results_table="my_results",
+    )
+    report = client.evaluate_categorical(config=config)
+
+    # Two queries: AI.GENERATE + DDL.
+    assert mock_bq.query.call_count == 2
+    ddl_sql = mock_bq.query.call_args_list[1][0][0]
+    assert "CREATE TABLE IF NOT EXISTS" in ddl_sql
+    assert "my_results" in ddl_sql
+
+    # insert_rows_json called with flattened rows.
+    mock_bq.insert_rows_json.assert_called_once()
+    table_ref = mock_bq.insert_rows_json.call_args[0][0]
+    assert "my_results" in table_ref
+    rows = mock_bq.insert_rows_json.call_args[0][1]
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == "s1"
+    assert rows[0]["metric_name"] == "tone"
+    assert rows[0]["category"] == "positive"
+
+    assert report.details["persisted"] is True
+    assert report.details["persisted_rows"] == 1
+
+  def test_persist_uses_default_table_name(self):
+    """When results_table is None, uses the default table name."""
+    client, mock_bq = self._make_client_with_results()
+
+    import json
+
+    row = {
+        "session_id": "s1",
+        "transcript": "USER: Hello",
+        "classifications": json.dumps(
+            [
+                {"metric_name": "tone", "category": "positive"},
+            ]
+        ),
+    }
+
+    call_count = [0]
+
+    def query_side_effect(*args, **kwargs):
+      call_count[0] += 1
+      result = MagicMock()
+      if call_count[0] == 1:
+        result.result.return_value = iter([row])
+      else:
+        result.result.return_value = None
+      return result
+
+    mock_bq.query.side_effect = query_side_effect
+
+    config = _make_categorical_config(persist_results=True)
+    report = client.evaluate_categorical(config=config)
+
+    table_ref = mock_bq.insert_rows_json.call_args[0][0]
+    assert "categorical_results" in table_ref
+
+  def test_persist_failure_sets_error_details(self):
+    """When insert fails, report should have persisted=False."""
+    client, mock_bq = self._make_client_with_results()
+
+    import json
+
+    row = {
+        "session_id": "s1",
+        "transcript": "USER: Hello",
+        "classifications": json.dumps(
+            [
+                {"metric_name": "tone", "category": "positive"},
+            ]
+        ),
+    }
+
+    call_count = [0]
+
+    def query_side_effect(*args, **kwargs):
+      call_count[0] += 1
+      result = MagicMock()
+      if call_count[0] == 1:
+        result.result.return_value = iter([row])
+      else:
+        result.result.return_value = None
+      return result
+
+    mock_bq.query.side_effect = query_side_effect
+    mock_bq.insert_rows_json.return_value = [{"errors": "some error"}]
+
+    config = _make_categorical_config(
+        persist_results=True,
+        results_table="my_results",
+    )
+    report = client.evaluate_categorical(config=config)
+
+    assert report.details["persisted"] is False
+    assert "persist_error" in report.details
+
+  def test_persist_ddl_failure_sets_error_details(self):
+    """When DDL fails, report should have persisted=False."""
+    client, mock_bq = self._make_client_with_results()
+
+    import json
+
+    row = {
+        "session_id": "s1",
+        "transcript": "USER: Hello",
+        "classifications": json.dumps(
+            [
+                {"metric_name": "tone", "category": "positive"},
+            ]
+        ),
+    }
+
+    call_count = [0]
+
+    def query_side_effect(*args, **kwargs):
+      call_count[0] += 1
+      result = MagicMock()
+      if call_count[0] == 1:
+        result.result.return_value = iter([row])
+      else:
+        result.result.side_effect = Exception("Permission denied")
+      return result
+
+    mock_bq.query.side_effect = query_side_effect
+
+    config = _make_categorical_config(
+        persist_results=True,
+        results_table="my_results",
+    )
+    report = client.evaluate_categorical(config=config)
+
+    assert report.details["persisted"] is False
+    assert "Permission denied" in report.details["persist_error"]
+
+  def test_persist_skipped_on_empty_results(self):
+    """When no sessions to persist, skip with a note."""
+    mock_bq = _mock_bq_client()
+    mock_bq.query.return_value.result.return_value = iter([])
+
+    client = Client(
+        project_id="proj",
+        dataset_id="ds",
+        verify_schema=False,
+        bq_client=mock_bq,
+    )
+    config = _make_categorical_config(
+        persist_results=True,
+        results_table="my_results",
+    )
+    report = client.evaluate_categorical(config=config)
+
+    assert report.details["persisted"] is False
+    assert report.details["persist_note"] == "no sessions to persist"
+    mock_bq.insert_rows_json.assert_not_called()

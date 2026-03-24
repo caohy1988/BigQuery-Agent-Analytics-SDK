@@ -56,10 +56,13 @@ from google.cloud import bigquery
 from .categorical_evaluator import build_categorical_prompt
 from .categorical_evaluator import build_categorical_report
 from .categorical_evaluator import CATEGORICAL_AI_GENERATE_QUERY
+from .categorical_evaluator import CATEGORICAL_RESULTS_DDL
 from .categorical_evaluator import CATEGORICAL_TRANSCRIPT_QUERY
 from .categorical_evaluator import CategoricalEvaluationConfig
 from .categorical_evaluator import CategoricalEvaluationReport
 from .categorical_evaluator import classify_sessions_via_api
+from .categorical_evaluator import DEFAULT_RESULTS_TABLE
+from .categorical_evaluator import flatten_results_to_rows
 from .categorical_evaluator import parse_categorical_row
 from .evaluators import _parse_json_from_text
 from .evaluators import AI_GENERATE_JUDGE_BATCH_QUERY
@@ -1221,6 +1224,7 @@ class Client:
           config=config,
       )
       report.details["execution_mode"] = "ai_generate"
+      self._persist_categorical_if_configured(report, config, endpoint)
       return report
     except Exception as e:
       logger.debug(
@@ -1245,6 +1249,7 @@ class Client:
       )
       report.details["execution_mode"] = "api_fallback"
       report.details["fallback_reason"] = fallback_reason
+      self._persist_categorical_if_configured(report, config, endpoint)
       return report
     except ImportError:
       # google-genai not installed — API fallback is unavailable.
@@ -1328,6 +1333,62 @@ class Client:
       transcripts[sid] = r.get("transcript", "")
 
     return _run_sync(classify_sessions_via_api(transcripts, config, endpoint))
+
+  def _persist_categorical_if_configured(
+      self,
+      report: CategoricalEvaluationReport,
+      config: CategoricalEvaluationConfig,
+      endpoint: str,
+  ) -> None:
+    """Persists categorical results to BigQuery when configured.
+
+    Creates the results table if it does not exist, flattens
+    session results to one row per ``(session_id, metric_name)``,
+    and writes via streaming insert.
+    """
+    if not config.persist_results:
+      return
+    if not report.session_results:
+      report.details["persisted"] = False
+      report.details["persist_note"] = "no sessions to persist"
+      return
+
+    results_table = config.results_table or DEFAULT_RESULTS_TABLE
+
+    try:
+      ddl = CATEGORICAL_RESULTS_DDL.format(
+          project=self.project_id,
+          dataset=self.dataset_id,
+          results_table=results_table,
+      )
+      self.bq_client.query(ddl).result()
+
+      rows = flatten_results_to_rows(report, config, endpoint)
+      table_ref = f"{self.project_id}.{self.dataset_id}.{results_table}"
+      errors = self.bq_client.insert_rows_json(table_ref, rows)
+      if errors:
+        logger.error(
+            "Failed to persist categorical results: %s",
+            errors,
+        )
+        report.details["persisted"] = False
+        report.details["persist_error"] = str(errors)
+      else:
+        logger.info(
+            "Persisted %d categorical result rows to %s",
+            len(rows),
+            table_ref,
+        )
+        report.details["persisted"] = True
+        report.details["persisted_rows"] = len(rows)
+        report.details["results_table"] = table_ref
+    except Exception as e:
+      logger.warning(
+          "Failed to persist categorical results: %s",
+          e,
+      )
+      report.details["persisted"] = False
+      report.details["persist_error"] = str(e)
 
   # -------------------------------------------------------------- #
   # Feedback & Curation                                              #

@@ -25,6 +25,7 @@ import pytest
 from bigquery_agent_analytics.categorical_evaluator import build_categorical_prompt
 from bigquery_agent_analytics.categorical_evaluator import build_categorical_report
 from bigquery_agent_analytics.categorical_evaluator import CATEGORICAL_AI_GENERATE_QUERY
+from bigquery_agent_analytics.categorical_evaluator import CATEGORICAL_RESULTS_DDL
 from bigquery_agent_analytics.categorical_evaluator import CATEGORICAL_TRANSCRIPT_QUERY
 from bigquery_agent_analytics.categorical_evaluator import CategoricalEvaluationConfig
 from bigquery_agent_analytics.categorical_evaluator import CategoricalEvaluationReport
@@ -33,6 +34,7 @@ from bigquery_agent_analytics.categorical_evaluator import CategoricalMetricDefi
 from bigquery_agent_analytics.categorical_evaluator import CategoricalMetricResult
 from bigquery_agent_analytics.categorical_evaluator import CategoricalSessionResult
 from bigquery_agent_analytics.categorical_evaluator import classify_sessions_via_api
+from bigquery_agent_analytics.categorical_evaluator import flatten_results_to_rows
 from bigquery_agent_analytics.categorical_evaluator import parse_categorical_row
 from bigquery_agent_analytics.categorical_evaluator import parse_classifications
 
@@ -753,3 +755,170 @@ class TestClassifySessionsViaApi:
     call_args = mock_aio_models.generate_content.call_args
     prompt_sent = call_args[1]["contents"]
     assert "[truncated]" in prompt_sent
+
+
+# ------------------------------------------------------------------ #
+# Persistence Tests                                                    #
+# ------------------------------------------------------------------ #
+
+
+class TestCategoricalResultsDDL:
+  """Tests for the results table DDL template."""
+
+  def test_creates_table_if_not_exists(self):
+    assert "CREATE TABLE IF NOT EXISTS" in CATEGORICAL_RESULTS_DDL
+
+  def test_contains_all_schema_columns(self):
+    for col in [
+        "session_id STRING",
+        "metric_name STRING",
+        "category STRING",
+        "justification STRING",
+        "passed_validation BOOL",
+        "parse_error BOOL",
+        "raw_response STRING",
+        "endpoint STRING",
+        "execution_mode STRING",
+        "prompt_version STRING",
+        "created_at TIMESTAMP",
+    ]:
+      assert col in CATEGORICAL_RESULTS_DDL
+
+  def test_format_succeeds(self):
+    formatted = CATEGORICAL_RESULTS_DDL.format(
+        project="p",
+        dataset="d",
+        results_table="my_results",
+    )
+    assert "p.d.my_results" in formatted
+
+
+class TestFlattenResultsToRows:
+  """Tests for flatten_results_to_rows."""
+
+  def test_basic_flattening(self):
+    config = _make_config()
+    sessions = [
+        CategoricalSessionResult(
+            session_id="s1",
+            metrics=[
+                CategoricalMetricResult(
+                    metric_name="tone",
+                    category="positive",
+                    justification="kind",
+                ),
+                CategoricalMetricResult(
+                    metric_name="safety",
+                    category="safe",
+                ),
+            ],
+        ),
+    ]
+    report = build_categorical_report("test_ds", sessions, config)
+    report.details["execution_mode"] = "ai_generate"
+
+    rows = flatten_results_to_rows(report, config, "gemini-2.5-flash")
+
+    assert len(rows) == 2
+    assert rows[0]["session_id"] == "s1"
+    assert rows[0]["metric_name"] == "tone"
+    assert rows[0]["category"] == "positive"
+    assert rows[0]["justification"] == "kind"
+    assert rows[0]["passed_validation"] is True
+    assert rows[0]["parse_error"] is False
+    assert rows[0]["endpoint"] == "gemini-2.5-flash"
+    assert rows[0]["execution_mode"] == "ai_generate"
+    assert rows[1]["metric_name"] == "safety"
+    assert rows[1]["category"] == "safe"
+
+  def test_includes_prompt_version(self):
+    config = _make_config()
+    config = config.model_copy(update={"prompt_version": "v2.1"})
+    sessions = [
+        CategoricalSessionResult(
+            session_id="s1",
+            metrics=[
+                CategoricalMetricResult(
+                    metric_name="tone", category="positive"
+                ),
+                CategoricalMetricResult(metric_name="safety", category="safe"),
+            ],
+        ),
+    ]
+    report = build_categorical_report("test_ds", sessions, config)
+    report.details["execution_mode"] = "ai_generate"
+
+    rows = flatten_results_to_rows(report, config, "gemini-2.5-flash")
+
+    assert all(r["prompt_version"] == "v2.1" for r in rows)
+
+  def test_parse_error_rows(self):
+    config = _make_config()
+    sessions = [
+        CategoricalSessionResult(
+            session_id="s1",
+            metrics=[
+                CategoricalMetricResult(
+                    metric_name="tone",
+                    parse_error=True,
+                    passed_validation=False,
+                    raw_response="bad json",
+                ),
+                CategoricalMetricResult(
+                    metric_name="safety",
+                    parse_error=True,
+                    passed_validation=False,
+                ),
+            ],
+        ),
+    ]
+    report = build_categorical_report("test_ds", sessions, config)
+    report.details["execution_mode"] = "api_fallback"
+
+    rows = flatten_results_to_rows(report, config, "gemini-2.5-flash")
+
+    assert len(rows) == 2
+    assert rows[0]["parse_error"] is True
+    assert rows[0]["passed_validation"] is False
+    assert rows[0]["raw_response"] == "bad json"
+    assert rows[0]["category"] is None
+    assert rows[0]["execution_mode"] == "api_fallback"
+
+  def test_empty_report(self):
+    config = _make_config()
+    report = build_categorical_report("test_ds", [], config)
+    rows = flatten_results_to_rows(report, config, "gemini-2.5-flash")
+    assert rows == []
+
+  def test_multiple_sessions(self):
+    config = _make_config()
+    sessions = [
+        CategoricalSessionResult(
+            session_id="s1",
+            metrics=[
+                CategoricalMetricResult(
+                    metric_name="tone", category="positive"
+                ),
+                CategoricalMetricResult(metric_name="safety", category="safe"),
+            ],
+        ),
+        CategoricalSessionResult(
+            session_id="s2",
+            metrics=[
+                CategoricalMetricResult(
+                    metric_name="tone", category="negative"
+                ),
+                CategoricalMetricResult(
+                    metric_name="safety", category="unsafe"
+                ),
+            ],
+        ),
+    ]
+    report = build_categorical_report("test_ds", sessions, config)
+    report.details["execution_mode"] = "ai_generate"
+
+    rows = flatten_results_to_rows(report, config, "gemini-2.5-flash")
+
+    assert len(rows) == 4
+    session_ids = [r["session_id"] for r in rows]
+    assert session_ids == ["s1", "s1", "s2", "s2"]
