@@ -197,6 +197,24 @@ class CategoricalEvaluationReport(BaseModel):
 # SQL Template                                                         #
 # ------------------------------------------------------------------ #
 
+DEFAULT_RESULTS_TABLE = "categorical_results"
+
+CATEGORICAL_RESULTS_DDL = """\
+CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{results_table}` (
+  session_id STRING,
+  metric_name STRING,
+  category STRING,
+  justification STRING,
+  passed_validation BOOL,
+  parse_error BOOL,
+  raw_response STRING,
+  endpoint STRING,
+  execution_mode STRING,
+  prompt_version STRING,
+  created_at TIMESTAMP
+)
+"""
+
 CATEGORICAL_TRANSCRIPT_QUERY = """\
 SELECT
   session_id,
@@ -614,3 +632,46 @@ async def classify_sessions_via_api(
     raise
 
   return results
+
+
+# ------------------------------------------------------------------ #
+# Persistence                                                          #
+# ------------------------------------------------------------------ #
+
+
+def flatten_results_to_rows(
+    report: CategoricalEvaluationReport,
+    config: CategoricalEvaluationConfig,
+    endpoint: str,
+) -> list[dict]:
+  """Flattens session results to one row per (session_id, metric_name).
+
+  Args:
+      report: The evaluation report to flatten.
+      config: Evaluation config (for prompt_version).
+      endpoint: Endpoint used for classification.
+
+  Returns:
+      List of dicts suitable for ``insert_rows_json``.
+  """
+  execution_mode = report.details.get("execution_mode")
+  created_at = report.created_at.isoformat()
+  rows = []
+  for sr in report.session_results:
+    for mr in sr.metrics:
+      rows.append(
+          {
+              "session_id": sr.session_id,
+              "metric_name": mr.metric_name,
+              "category": mr.category,
+              "justification": mr.justification,
+              "passed_validation": mr.passed_validation,
+              "parse_error": mr.parse_error,
+              "raw_response": mr.raw_response,
+              "endpoint": endpoint,
+              "execution_mode": execution_mode,
+              "prompt_version": config.prompt_version,
+              "created_at": created_at,
+          }
+      )
+  return rows
