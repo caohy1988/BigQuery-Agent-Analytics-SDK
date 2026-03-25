@@ -24,12 +24,15 @@ Usage::
     bq-agent-sdk distribution --project-id=P --dataset-id=D
     bq-agent-sdk hitl-metrics --project-id=P --dataset-id=D
     bq-agent-sdk list-traces --project-id=P --dataset-id=D
+    bq-agent-sdk categorical-eval --project-id=P --dataset-id=D --metrics-file=M
     bq-agent-sdk views create-all --project-id=P --dataset-id=D
     bq-agent-sdk views create --project-id=P --dataset-id=D EVENT_TYPE
 """
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import sys
 from typing import Optional
 
@@ -506,6 +509,129 @@ def list_traces(
     client = _build_client(project_id, dataset_id, table_id, location)
     traces = client.list_traces(filter_criteria=filters)
     typer.echo(format_output(traces, fmt))
+  except Exception as exc:
+    typer.echo(f"Error: {exc}", err=True)
+    raise typer.Exit(code=2)
+
+
+# ------------------------------------------------------------------ #
+# categorical-eval                                                     #
+# ------------------------------------------------------------------ #
+
+
+@app.command("categorical-eval")
+def categorical_eval(
+    project_id: str = typer.Option(
+        ..., envvar="BQ_AGENT_PROJECT", help=_PROJECT_HELP
+    ),
+    dataset_id: str = typer.Option(
+        ..., envvar="BQ_AGENT_DATASET", help=_DATASET_HELP
+    ),
+    table_id: str = typer.Option("agent_events", help="Events table name."),
+    location: str = typer.Option("us-central1", help="BQ location."),
+    metrics_file: Path = typer.Option(
+        ...,
+        help="JSON file with metric definitions.",
+        exists=True,
+        readable=True,
+    ),
+    agent_id: Optional[str] = typer.Option(None, help="Filter by agent name."),
+    last: Optional[str] = typer.Option(
+        None,
+        help="Time window: 30m, 1h, 24h, 7d, 30d.",
+    ),
+    limit: int = typer.Option(100, help="Max sessions to evaluate."),
+    endpoint: Optional[str] = typer.Option(
+        None,
+        help="Model endpoint for classification.",
+    ),
+    connection_id: Optional[str] = typer.Option(
+        None,
+        help="BQ connection ID for AI.GENERATE.",
+    ),
+    include_justification: bool = typer.Option(
+        True,
+        help="Include justification in output.",
+    ),
+    persist: bool = typer.Option(
+        False,
+        help="Write results to BigQuery.",
+    ),
+    results_table: Optional[str] = typer.Option(
+        None,
+        help="Destination table for persisted results.",
+    ),
+    prompt_version: Optional[str] = typer.Option(
+        None,
+        help="Prompt version tag for reproducibility.",
+    ),
+    fmt: str = typer.Option(
+        "json",
+        "--format",
+        help="Output format: json|text|table.",
+    ),
+) -> None:
+  """Run categorical evaluation over agent traces."""
+  try:
+    from .categorical_evaluator import CategoricalEvaluationConfig
+    from .categorical_evaluator import CategoricalMetricCategory
+    from .categorical_evaluator import CategoricalMetricDefinition
+
+    raw = json.loads(metrics_file.read_text())
+    metrics_list = raw if isinstance(raw, list) else raw.get("metrics", [])
+
+    metrics = []
+    for m in metrics_list:
+      cats = [
+          CategoricalMetricCategory(
+              name=c["name"],
+              definition=c["definition"],
+          )
+          for c in m["categories"]
+      ]
+      metrics.append(
+          CategoricalMetricDefinition(
+              name=m["name"],
+              definition=m["definition"],
+              categories=cats,
+          )
+      )
+
+    if not metrics:
+      typer.echo("Error: no metrics found in metrics file.", err=True)
+      raise typer.Exit(code=2)
+
+    config_kwargs: dict = {
+        "metrics": metrics,
+        "include_justification": include_justification,
+        "persist_results": persist,
+    }
+    if endpoint is not None:
+      config_kwargs["endpoint"] = endpoint
+    if results_table is not None:
+      config_kwargs["results_table"] = results_table
+    if prompt_version is not None:
+      config_kwargs["prompt_version"] = prompt_version
+    config = CategoricalEvaluationConfig(**config_kwargs)
+
+    filters = TraceFilter.from_cli_args(
+        last=last,
+        agent_id=agent_id,
+        limit=limit,
+    )
+
+    client = _build_client(
+        project_id,
+        dataset_id,
+        table_id,
+        location,
+        endpoint=endpoint,
+        connection_id=connection_id,
+    )
+    report = client.evaluate_categorical(config=config, filters=filters)
+    typer.echo(format_output(report, fmt))
+  except typer.Exit:
+    raise
   except Exception as exc:
     typer.echo(f"Error: {exc}", err=True)
     raise typer.Exit(code=2)

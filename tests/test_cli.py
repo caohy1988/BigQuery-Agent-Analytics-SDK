@@ -1035,3 +1035,269 @@ class TestViews:
         ],
     )
     assert result.exit_code == 2
+
+
+# ------------------------------------------------------------------ #
+# categorical-eval                                                     #
+# ------------------------------------------------------------------ #
+
+_METRICS_JSON = [
+    {
+        "name": "tone",
+        "definition": "Overall tone of the conversation.",
+        "categories": [
+            {"name": "positive", "definition": "User is satisfied."},
+            {"name": "negative", "definition": "User is frustrated."},
+            {"name": "neutral", "definition": "No strong sentiment."},
+        ],
+    },
+]
+
+
+def _mock_categorical_report():
+  from bigquery_agent_analytics.categorical_evaluator import CategoricalEvaluationReport
+  from bigquery_agent_analytics.categorical_evaluator import CategoricalMetricResult
+  from bigquery_agent_analytics.categorical_evaluator import CategoricalSessionResult
+
+  return CategoricalEvaluationReport(
+      dataset="test",
+      total_sessions=2,
+      session_results=[
+          CategoricalSessionResult(
+              session_id="s1",
+              metrics=[
+                  CategoricalMetricResult(
+                      metric_name="tone",
+                      category="positive",
+                      passed_validation=True,
+                  ),
+              ],
+          ),
+          CategoricalSessionResult(
+              session_id="s2",
+              metrics=[
+                  CategoricalMetricResult(
+                      metric_name="tone",
+                      category="negative",
+                      passed_validation=True,
+                  ),
+              ],
+          ),
+      ],
+      category_distributions={"tone": {"positive": 1, "negative": 1}},
+      details={"execution_mode": "ai_generate"},
+  )
+
+
+class TestCategoricalEval:
+
+  def _write_metrics(self, tmp_path):
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(json.dumps(_METRICS_JSON))
+    return str(metrics_path)
+
+  @patch("bigquery_agent_analytics.cli._build_client")
+  def test_categorical_eval_json(self, mock_build, tmp_path):
+    client = MagicMock()
+    client.evaluate_categorical.return_value = _mock_categorical_report()
+    mock_build.return_value = client
+    metrics_path = self._write_metrics(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            f"--metrics-file={metrics_path}",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    parsed = json.loads(result.output)
+    assert parsed["total_sessions"] == 2
+    assert "tone" in parsed["category_distributions"]
+
+  @patch("bigquery_agent_analytics.cli._build_client")
+  def test_categorical_eval_text_format(self, mock_build, tmp_path):
+    client = MagicMock()
+    client.evaluate_categorical.return_value = _mock_categorical_report()
+    mock_build.return_value = client
+    metrics_path = self._write_metrics(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            f"--metrics-file={metrics_path}",
+            "--format=text",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "categorical_evaluator" in result.output
+
+  @patch("bigquery_agent_analytics.cli._build_client")
+  def test_categorical_eval_with_filters(self, mock_build, tmp_path):
+    client = MagicMock()
+    client.evaluate_categorical.return_value = _mock_categorical_report()
+    mock_build.return_value = client
+    metrics_path = self._write_metrics(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            f"--metrics-file={metrics_path}",
+            "--agent-id=bot",
+            "--last=7d",
+            "--limit=50",
+        ],
+    )
+    assert result.exit_code == 0
+    call_kwargs = client.evaluate_categorical.call_args[1]
+    assert call_kwargs["filters"].agent_id == "bot"
+    assert call_kwargs["filters"].limit == 50
+
+  @patch("bigquery_agent_analytics.cli._build_client")
+  def test_categorical_eval_persist_flags(self, mock_build, tmp_path):
+    client = MagicMock()
+    client.evaluate_categorical.return_value = _mock_categorical_report()
+    mock_build.return_value = client
+    metrics_path = self._write_metrics(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            f"--metrics-file={metrics_path}",
+            "--persist",
+            "--results-table=my_results",
+            "--prompt-version=v1",
+        ],
+    )
+    assert result.exit_code == 0
+    call_kwargs = client.evaluate_categorical.call_args[1]
+    config = call_kwargs["config"]
+    assert config.persist_results is True
+    assert config.results_table == "my_results"
+    assert config.prompt_version == "v1"
+
+  @patch("bigquery_agent_analytics.cli._build_client")
+  def test_categorical_eval_endpoint_override(self, mock_build, tmp_path):
+    client = MagicMock()
+    client.evaluate_categorical.return_value = _mock_categorical_report()
+    mock_build.return_value = client
+    metrics_path = self._write_metrics(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            f"--metrics-file={metrics_path}",
+            "--endpoint=gemini-2.0-flash",
+        ],
+    )
+    assert result.exit_code == 0
+    call_kwargs = client.evaluate_categorical.call_args[1]
+    assert call_kwargs["config"].endpoint == "gemini-2.0-flash"
+    # Also passed to _build_client
+    build_kwargs = mock_build.call_args
+    assert (
+        build_kwargs[1].get("endpoint") == "gemini-2.0-flash"
+        or build_kwargs[0][4] == "gemini-2.0-flash"
+    )
+
+  @patch("bigquery_agent_analytics.cli._build_client")
+  def test_categorical_eval_no_justification(self, mock_build, tmp_path):
+    client = MagicMock()
+    client.evaluate_categorical.return_value = _mock_categorical_report()
+    mock_build.return_value = client
+    metrics_path = self._write_metrics(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            f"--metrics-file={metrics_path}",
+            "--no-include-justification",
+        ],
+    )
+    assert result.exit_code == 0
+    call_kwargs = client.evaluate_categorical.call_args[1]
+    assert call_kwargs["config"].include_justification is False
+
+  @patch("bigquery_agent_analytics.cli._build_client")
+  def test_categorical_eval_metrics_dict_format(self, mock_build, tmp_path):
+    """Metrics file can be a dict with a 'metrics' key."""
+    client = MagicMock()
+    client.evaluate_categorical.return_value = _mock_categorical_report()
+    mock_build.return_value = client
+
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(json.dumps({"metrics": _METRICS_JSON}))
+
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            f"--metrics-file={str(metrics_path)}",
+        ],
+    )
+    assert result.exit_code == 0
+
+  @patch("bigquery_agent_analytics.cli._build_client")
+  def test_categorical_eval_error_exit_2(self, mock_build, tmp_path):
+    client = MagicMock()
+    client.evaluate_categorical.side_effect = RuntimeError("BQ fail")
+    mock_build.return_value = client
+    metrics_path = self._write_metrics(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            f"--metrics-file={metrics_path}",
+        ],
+    )
+    assert result.exit_code == 2
+
+  def test_categorical_eval_missing_metrics_file_exit_2(self):
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            "--metrics-file=/nonexistent/file.json",
+        ],
+    )
+    assert result.exit_code == 2
+
+  @patch("bigquery_agent_analytics.cli._build_client")
+  def test_categorical_eval_empty_metrics_exit_2(self, mock_build, tmp_path):
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text("[]")
+
+    result = runner.invoke(
+        app,
+        [
+            "categorical-eval",
+            "--project-id=proj",
+            "--dataset-id=ds",
+            f"--metrics-file={str(metrics_path)}",
+        ],
+    )
+    assert result.exit_code == 2
