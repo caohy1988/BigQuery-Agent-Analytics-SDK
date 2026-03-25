@@ -650,6 +650,7 @@ def categorical_views(
     results_table: str = typer.Option(
         "categorical_results", help="Source results table name."
     ),
+    location: str = typer.Option("us-central1", help="BQ location."),
     prefix: str = typer.Option("", help="View name prefix."),
     fmt: str = typer.Option(
         "json",
@@ -666,6 +667,7 @@ def categorical_views(
         dataset_id=dataset_id,
         results_table=results_table,
         view_prefix=prefix,
+        location=location,
     )
     result = vm.create_all_views()
     typer.echo(format_output(result, fmt))

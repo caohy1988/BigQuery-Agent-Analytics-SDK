@@ -1573,6 +1573,7 @@ class TestCreateCategoricalViews:
           dataset_id="ds",
           results_table="categorical_results",
           view_prefix="",
+          location="us-central1",
           bq_client=mock_bq,
       )
       assert "categorical_results_latest" in result

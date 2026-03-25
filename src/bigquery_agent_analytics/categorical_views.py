@@ -125,6 +125,7 @@ class CategoricalViewManager:
       dataset_id: BigQuery dataset containing results.
       results_table: Source table name (default ``categorical_results``).
       view_prefix: Optional prefix for view names (e.g. ``"adk_"``).
+      location: BigQuery location (e.g. ``"US"`` or ``"us-central1"``).
       bq_client: Optional pre-configured BigQuery client.
   """
 
@@ -134,18 +135,23 @@ class CategoricalViewManager:
       dataset_id: str,
       results_table: str = DEFAULT_RESULTS_TABLE,
       view_prefix: str = "",
+      location: Optional[str] = None,
       bq_client: Optional[bigquery.Client] = None,
   ) -> None:
     self.project_id = project_id
     self.dataset_id = dataset_id
     self.results_table = results_table
     self.view_prefix = view_prefix
+    self.location = location
     self._bq_client = bq_client
 
   @property
   def bq_client(self) -> bigquery.Client:
     if self._bq_client is None:
-      self._bq_client = bigquery.Client(project=self.project_id)
+      kwargs: dict = {"project": self.project_id}
+      if self.location:
+        kwargs["location"] = self.location
+      self._bq_client = bigquery.Client(**kwargs)
     return self._bq_client
 
   def available_views(self) -> list[str]:

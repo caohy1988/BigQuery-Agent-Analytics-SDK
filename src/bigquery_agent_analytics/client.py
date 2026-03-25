@@ -1419,6 +1419,7 @@ class Client:
         dataset_id=self.dataset_id,
         results_table=results_table or DEFAULT_RESULTS_TABLE,
         view_prefix=view_prefix,
+        location=self.location,
         bq_client=self.bq_client,
     )
     return vm.create_all_views()

@@ -177,3 +177,33 @@ class TestCategoricalViewManager:
     """validation_failures should exclude parse_error rows."""
     sql = vm.get_view_sql("categorical_operational_metrics")
     assert "NOT passed_validation AND NOT parse_error" in sql
+
+  def test_location_passed_to_lazy_client(self):
+    """When no bq_client is given, the lazy client uses the location."""
+    vm = CategoricalViewManager(
+        project_id=PROJECT,
+        dataset_id=DATASET,
+        location="EU",
+    )
+    assert vm.location == "EU"
+
+    with mock.patch(
+        "bigquery_agent_analytics.categorical_views.bigquery.Client"
+    ) as mock_bq_cls:
+      mock_bq_cls.return_value = mock.MagicMock()
+      _ = vm.bq_client
+      mock_bq_cls.assert_called_once_with(project=PROJECT, location="EU")
+
+  def test_no_location_omits_kwarg(self):
+    """When location is None, the lazy client omits the location kwarg."""
+    vm = CategoricalViewManager(
+        project_id=PROJECT,
+        dataset_id=DATASET,
+    )
+
+    with mock.patch(
+        "bigquery_agent_analytics.categorical_views.bigquery.Client"
+    ) as mock_bq_cls:
+      mock_bq_cls.return_value = mock.MagicMock()
+      _ = vm.bq_client
+      mock_bq_cls.assert_called_once_with(project=PROJECT)
