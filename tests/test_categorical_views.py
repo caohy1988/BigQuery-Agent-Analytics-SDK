@@ -86,6 +86,8 @@ class TestCategoricalViewManager:
     assert "SAFE_DIVIDE" in sql
     assert "parse_error_rate" in sql
     assert "validation_failures" in sql
+    assert "fallback_count" in sql
+    assert "fallback_rate" in sql
     assert "categorical_results_latest" in sql
 
   def test_get_view_sql_unknown_raises(self, vm):

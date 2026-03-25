@@ -170,12 +170,20 @@ ORDER BY metric_name, prompt_version, category;
 -- counts remain correct regardless of how many times a session
 -- is evaluated.
 --
--- For Cloud Scheduler / Cloud Run Jobs:
+-- For Cloud Run Jobs (wraps the same CLI in a container):
 --
---   gcloud scheduler jobs create http categorical-eval-job \
+--   # 1. Build an image that installs bq-agent-sdk
+--   # 2. Create a Cloud Run job that runs the CLI
+--   gcloud run jobs create categorical-eval-job \
+--     --image=IMAGE_URL \
+--     --command="bq-agent-sdk" \
+--     --args="categorical-eval,--project-id=PROJECT,--dataset-id=DATASET,--metrics-file=/config/metrics.json,--last=5m,--persist,--prompt-version=v2"
+--
+--   # 3. Schedule it with Cloud Scheduler
+--   gcloud scheduler jobs create http categorical-eval-schedule \
 --     --schedule="*/5 * * * *" \
---     --uri="https://CLOUD_RUN_URL/evaluate" \
+--     --uri="https://REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/PROJECT/jobs/categorical-eval-job:run" \
 --     --http-method=POST \
---     --message-body='{"last":"5m","persist":true}'
+--     --oauth-service-account-email=SA_EMAIL
 --
 -- =================================================================
