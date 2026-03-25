@@ -1391,6 +1391,39 @@ class Client:
       report.details["persist_error"] = str(e)
 
   # -------------------------------------------------------------- #
+  # Categorical Views                                                #
+  # -------------------------------------------------------------- #
+
+  def create_categorical_views(
+      self,
+      results_table: Optional[str] = None,
+      view_prefix: str = "",
+  ) -> dict[str, str]:
+    """Creates dashboard views over categorical evaluation results.
+
+    Delegates to :class:`CategoricalViewManager` to create a dedup
+    base view and aggregated dashboard views.
+
+    Args:
+        results_table: Results table name. Defaults to
+            ``categorical_results``.
+        view_prefix: Optional prefix for view names.
+
+    Returns:
+        A dict mapping view name to prefixed view name.
+    """
+    from .categorical_views import CategoricalViewManager
+
+    vm = CategoricalViewManager(
+        project_id=self.project_id,
+        dataset_id=self.dataset_id,
+        results_table=results_table or DEFAULT_RESULTS_TABLE,
+        view_prefix=view_prefix,
+        bq_client=self.bq_client,
+    )
+    return vm.create_all_views()
+
+  # -------------------------------------------------------------- #
   # Feedback & Curation                                              #
   # -------------------------------------------------------------- #
 

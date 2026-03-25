@@ -25,6 +25,7 @@ Usage::
     bq-agent-sdk hitl-metrics --project-id=P --dataset-id=D
     bq-agent-sdk list-traces --project-id=P --dataset-id=D
     bq-agent-sdk categorical-eval --project-id=P --dataset-id=D --metrics-file=M
+    bq-agent-sdk categorical-views --project-id=P --dataset-id=D
     bq-agent-sdk views create-all --project-id=P --dataset-id=D
     bq-agent-sdk views create --project-id=P --dataset-id=D EVENT_TYPE
 """
@@ -628,6 +629,46 @@ def categorical_eval(
     typer.echo(format_output(report, fmt))
   except typer.Exit:
     raise
+  except Exception as exc:
+    typer.echo(f"Error: {exc}", err=True)
+    raise typer.Exit(code=2)
+
+
+# ------------------------------------------------------------------ #
+# categorical-views                                                    #
+# ------------------------------------------------------------------ #
+
+
+@app.command("categorical-views")
+def categorical_views(
+    project_id: str = typer.Option(
+        ..., envvar="BQ_AGENT_PROJECT", help=_PROJECT_HELP
+    ),
+    dataset_id: str = typer.Option(
+        ..., envvar="BQ_AGENT_DATASET", help=_DATASET_HELP
+    ),
+    results_table: str = typer.Option(
+        "categorical_results", help="Source results table name."
+    ),
+    prefix: str = typer.Option("", help="View name prefix."),
+    fmt: str = typer.Option(
+        "json",
+        "--format",
+        help="Output format: json|text|table.",
+    ),
+) -> None:
+  """Create dashboard views over categorical evaluation results."""
+  try:
+    from .categorical_views import CategoricalViewManager
+
+    vm = CategoricalViewManager(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        results_table=results_table,
+        view_prefix=prefix,
+    )
+    result = vm.create_all_views()
+    typer.echo(format_output(result, fmt))
   except Exception as exc:
     typer.echo(f"Error: {exc}", err=True)
     raise typer.Exit(code=2)
