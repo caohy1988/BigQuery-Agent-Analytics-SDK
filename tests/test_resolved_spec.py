@@ -165,3 +165,92 @@ class TestResolveBuilder:
     g1 = resolve(ont, bnd)
     g2 = resolve(ont, bnd)
     assert g1 == g2
+
+
+class TestCrossValidation:
+  """Prove resolve() matches graph_spec_from_ontology_binding() output."""
+
+  def test_entity_sources_match(self):
+    """Fully-qualified sources must be identical."""
+    ont, bnd = _load()
+    graph = resolve(ont, bnd)
+    from bigquery_agent_analytics.runtime_spec import (
+        graph_spec_from_ontology_binding,
+    )
+    spec = graph_spec_from_ontology_binding(ont, bnd)
+
+    resolved_sources = {e.name: e.source for e in graph.entities}
+    spec_sources = {e.name: e.binding.source for e in spec.entities}
+    assert resolved_sources == spec_sources
+
+  def test_entity_key_columns_match(self):
+    """Physical key columns must be identical."""
+    ont, bnd = _load()
+    graph = resolve(ont, bnd)
+    from bigquery_agent_analytics.runtime_spec import (
+        graph_spec_from_ontology_binding,
+    )
+    spec = graph_spec_from_ontology_binding(ont, bnd)
+
+    resolved_keys = {
+        e.name: e.key_columns for e in graph.entities
+    }
+    spec_keys = {
+        e.name: tuple(e.keys.primary) for e in spec.entities
+    }
+    assert resolved_keys == spec_keys
+
+  def test_entity_property_columns_match(self):
+    """Physical property column names must be identical."""
+    ont, bnd = _load()
+    graph = resolve(ont, bnd)
+    from bigquery_agent_analytics.runtime_spec import (
+        graph_spec_from_ontology_binding,
+    )
+    spec = graph_spec_from_ontology_binding(ont, bnd)
+
+    for re, se in zip(
+        sorted(graph.entities, key=lambda e: e.name),
+        sorted(spec.entities, key=lambda e: e.name),
+    ):
+      resolved_cols = [p.column for p in re.properties]
+      spec_cols = [p.name for p in se.properties]
+      assert resolved_cols == spec_cols, f"Mismatch on {re.name}"
+
+  def test_relationship_sources_match(self):
+    ont, bnd = _load()
+    graph = resolve(ont, bnd)
+    from bigquery_agent_analytics.runtime_spec import (
+        graph_spec_from_ontology_binding,
+    )
+    spec = graph_spec_from_ontology_binding(ont, bnd)
+
+    resolved_sources = {r.name: r.source for r in graph.relationships}
+    spec_sources = {
+        r.name: r.binding.source for r in spec.relationships
+    }
+    assert resolved_sources == spec_sources
+
+  def test_relationship_endpoint_columns_match(self):
+    ont, bnd = _load()
+    graph = resolve(ont, bnd)
+    from bigquery_agent_analytics.runtime_spec import (
+        graph_spec_from_ontology_binding,
+    )
+    spec = graph_spec_from_ontology_binding(ont, bnd)
+
+    for rr, sr in zip(graph.relationships, spec.relationships):
+      assert rr.from_columns == tuple(sr.binding.from_columns)
+      assert rr.to_columns == tuple(sr.binding.to_columns)
+
+  def test_entity_labels_match(self):
+    ont, bnd = _load()
+    graph = resolve(ont, bnd)
+    from bigquery_agent_analytics.runtime_spec import (
+        graph_spec_from_ontology_binding,
+    )
+    spec = graph_spec_from_ontology_binding(ont, bnd)
+
+    resolved_labels = {e.name: e.labels for e in graph.entities}
+    spec_labels = {e.name: tuple(e.labels) for e in spec.entities}
+    assert resolved_labels == spec_labels
