@@ -96,3 +96,181 @@ class ResolvedGraph:
   name: str
   entities: tuple[ResolvedEntity, ...]
   relationships: tuple[ResolvedRelationship, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class LineageEdgeConfig:
+  """Cross-session lineage configuration for a relationship edge."""
+
+  from_session_column: str
+  to_session_column: str
+
+
+# -- Type mapping: upstream PropertyType -> SDK type string ------------
+
+_PROPERTY_TYPE_TO_SDK: dict[str, str] = {
+    "string": "string",
+    "bytes": "bytes",
+    "integer": "int64",
+    "double": "double",
+    "numeric": "double",
+    "boolean": "boolean",
+    "date": "date",
+    "time": "string",
+    "datetime": "timestamp",
+    "timestamp": "timestamp",
+    "json": "string",
+}
+
+
+# -- Source qualification -----------------------------------------------
+
+def _qualify_source(
+    raw_source: str, project: str, dataset: str
+) -> str:
+  """Qualify a binding source to a fully-qualified BQ table reference.
+
+  Rules (matching runtime_spec._resolve_source):
+  * 2+ dots -> used verbatim (already fully qualified).
+  * 1 dot   -> ``{project}.{raw_source}`` (dataset.table).
+  * 0 dots  -> ``{project}.{dataset}.{raw_source}`` (bare table).
+  """
+  dot_count = raw_source.count(".")
+  if dot_count >= 2:
+    return raw_source
+  if dot_count == 1:
+    return f"{project}.{raw_source}"
+  return f"{project}.{dataset}.{raw_source}"
+
+
+# -- Builder ------------------------------------------------------------
+
+def resolve(
+    ontology,
+    binding,
+    lineage_config: dict[str, LineageEdgeConfig] | None = None,
+) -> ResolvedGraph:
+  """Build a ``ResolvedGraph`` from an upstream Ontology + Binding.
+
+  This is the single place where ontology/binding impedance matching
+  happens. All downstream SDK modules should consume the resolved
+  output rather than re-implementing the mapping.
+
+  Args:
+      ontology: A validated ``bigquery_ontology.Ontology``.
+      binding: A validated ``bigquery_ontology.Binding`` referencing
+          this ontology.
+      lineage_config: Optional dict mapping relationship names to
+          ``LineageEdgeConfig`` for cross-session lineage edges.
+
+  Returns:
+      A frozen ``ResolvedGraph`` ready for consumption by SDK runtime.
+
+  Raises:
+      ValueError: If a bound entity/relationship is not found in the
+          ontology, or if an entity has no primary key.
+  """
+  lineage_config = lineage_config or {}
+  project = binding.target.project
+  dataset = binding.target.dataset
+
+  ont_entity_map = {e.name: e for e in ontology.entities}
+  ont_rel_map = {r.name: r for r in ontology.relationships}
+
+  # -- Entities --------------------------------------------------------
+  resolved_entities: list[ResolvedEntity] = []
+  for eb in binding.entities:
+    ont_entity = ont_entity_map.get(eb.name)
+    if ont_entity is None:
+      raise ValueError(
+          f"Binding references entity {eb.name!r} which is not "
+          f"defined in ontology {ontology.ontology!r}."
+      )
+
+    col_map: dict[str, str] = {bp.name: bp.column for bp in eb.properties}
+
+    if ont_entity.keys is None or ont_entity.keys.primary is None:
+      raise ValueError(
+          f"Entity {eb.name!r} has no primary key defined."
+      )
+    key_columns = tuple(
+        col_map.get(k, k) for k in ont_entity.keys.primary
+    )
+
+    labels: tuple[str, ...]
+    if ont_entity.extends:
+      labels = (ont_entity.name, ont_entity.extends)
+    else:
+      labels = (ont_entity.name,)
+
+    properties: list[ResolvedProperty] = []
+    for prop in ont_entity.properties:
+      if prop.expr is not None:
+        continue
+      sdk_type = _PROPERTY_TYPE_TO_SDK.get(prop.type.value, "string")
+      properties.append(ResolvedProperty(
+          column=col_map.get(prop.name, prop.name),
+          logical_name=prop.name,
+          sdk_type=sdk_type,
+          description=prop.description or "",
+      ))
+
+    resolved_entities.append(ResolvedEntity(
+        name=ont_entity.name,
+        source=_qualify_source(eb.source, project, dataset),
+        key_columns=key_columns,
+        labels=labels,
+        properties=tuple(properties),
+        description=ont_entity.description or "",
+        extends=ont_entity.extends,
+    ))
+
+  # -- Relationships ---------------------------------------------------
+  resolved_rels: list[ResolvedRelationship] = []
+  for rb in binding.relationships:
+    ont_rel = ont_rel_map.get(rb.name)
+    if ont_rel is None:
+      raise ValueError(
+          f"Binding references relationship {rb.name!r} which is not "
+          f"defined in ontology {ontology.ontology!r}."
+      )
+
+    col_map = {bp.name: bp.column for bp in rb.properties}
+
+    properties = []
+    for prop in ont_rel.properties:
+      if prop.expr is not None:
+        continue
+      sdk_type = _PROPERTY_TYPE_TO_SDK.get(prop.type.value, "string")
+      properties.append(ResolvedProperty(
+          column=col_map.get(prop.name, prop.name),
+          logical_name=prop.name,
+          sdk_type=sdk_type,
+          description=prop.description or "",
+      ))
+
+    lineage = lineage_config.get(rb.name)
+    from_session: str | None = None
+    to_session: str | None = None
+    if lineage is not None:
+      from_session = lineage.from_session_column
+      to_session = lineage.to_session_column
+
+    resolved_rels.append(ResolvedRelationship(
+        name=ont_rel.name,
+        source=_qualify_source(rb.source, project, dataset),
+        from_entity=ont_rel.from_,
+        to_entity=ont_rel.to,
+        from_columns=tuple(rb.from_columns),
+        to_columns=tuple(rb.to_columns),
+        properties=tuple(properties),
+        description=ont_rel.description or "",
+        from_session_column=from_session,
+        to_session_column=to_session,
+    ))
+
+  return ResolvedGraph(
+      name=ontology.ontology,
+      entities=tuple(resolved_entities),
+      relationships=tuple(resolved_rels),
+  )
